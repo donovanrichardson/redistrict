@@ -1,0 +1,32 @@
+[project]
+name = "redistrict"
+version = "0.1.0"
+description = "Population-balanced redistricting via PyMETIS graph partitioning on US Census geographies"
+requires-python = ">=3.12"
+dependencies = [
+    "pymetis>=2023.1",
+    "scipy>=1.13",
+    "networkx>=3.3",
+    "numpy>=1.26",
+    "textual>=0.80",
+    "inquirerpy>=0.3.4",
+    "psycopg2-binary>=2.9",
+    "shapely>=2.0",
+    "pyproj>=3.6",
+]
+
+[project.scripts]
+redistrict = "redistrict.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
