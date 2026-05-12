@@ -11,6 +11,7 @@ dependencies = [
     "textual>=0.80",
     "inquirerpy>=0.3.4",
     "psycopg2-binary>=2.9",
+    "tqdm>=4.66",
     "shapely>=2.0",
     "pyproj>=3.6",
 ]

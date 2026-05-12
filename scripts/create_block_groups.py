@@ -20,9 +20,8 @@ Population-weighted centroid:
   lon = SUM(pop20 * intptlon20::float) / SUM(pop20)
   Falls back to geometric centroid of ST_Union when total pop = 0.
 
-The table is created if it does not exist. If it already exists, rows for the
-target state are upserted so the script is safe to re-run and can be called
-once per state to build up national coverage incrementally.
+The table is created if it does not exist. Processing is county-by-county
+within each state (tqdm progress). Each state is committed as one transaction.
 """
 
 import logging
@@ -33,9 +32,12 @@ from datetime import datetime
 from pathlib import Path
 
 import psycopg2
+from tqdm import tqdm
 
-# Set to a 2-digit state FIPS to restrict to one state, or None for all states.
-STATE_FIPS = os.getenv("STATE_FIPS", "44")  # 44 = Rhode Island
+# States to process: Rhode Island (44), Vermont (50), New Hampshire (33).
+# Override with STATE_FIPS env var (comma-separated) or set to empty for all states.
+_env_fips = os.getenv("STATE_FIPS", "50,33")
+STATE_FIPS_LIST: list[str] = [s.strip() for s in _env_fips.split(",") if s.strip()] if _env_fips else []
 
 DB_CRED = {
     "host":     os.getenv("POSTGRES_HOST", "localhost"),
@@ -69,7 +71,14 @@ CREATE INDEX IF NOT EXISTS block_groups_2020_statefp_idx
     ON public.block_groups_2020 (statefp20);
 """
 
-UPSERT_SQL = """
+COUNTIES_SQL = """
+SELECT DISTINCT countyfp20
+FROM public.blocks_2020
+WHERE statefp20 = %(statefp)s
+ORDER BY countyfp20;
+"""
+
+UPSERT_COUNTY_SQL = """
 INSERT INTO public.block_groups_2020
     (geoid20, statefp20, countyfp20, tractce20,
      geom, pop20, aland20, awater20,
@@ -91,7 +100,8 @@ WITH agg AS (
         ST_X(ST_Centroid(ST_Union(geom)))          AS geom_centroid_lon
     FROM public.blocks_2020
     WHERE geom IS NOT NULL
-      AND (%(statefp)s IS NULL OR statefp20 = %(statefp)s)
+      AND statefp20  = %(statefp)s
+      AND countyfp20 = %(countyfp)s
     GROUP BY LEFT(geoid20, 12), statefp20, countyfp20, tractce20
 )
 SELECT
@@ -146,9 +156,26 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
+def process_state(cur, statefp: str, log: logging.Logger) -> int:
+    cur.execute(COUNTIES_SQL, {"statefp": statefp})
+    counties = [row[0] for row in cur.fetchall()]
+    if not counties:
+        log.warning(f"State {statefp}: no counties found in blocks_2020, skipping.")
+        return 0
+
+    total_rows = 0
+    for countyfp in tqdm(counties, desc=f"State {statefp}", unit="county", leave=True):
+        cur.execute(UPSERT_COUNTY_SQL, {"statefp": statefp, "countyfp": countyfp})
+        total_rows += cur.rowcount
+
+    return total_rows
+
+
 def main():
     log = setup_logging()
-    log.info("Connecting to database...")
+    scope = ", ".join(STATE_FIPS_LIST) if STATE_FIPS_LIST else "all states"
+    log.info(f"Processing states: {scope}")
+
     conn = psycopg2.connect(**DB_CRED)
     conn.autocommit = False
 
@@ -158,15 +185,18 @@ def main():
             cur.execute(CREATE_TABLE_SQL)
             conn.commit()
 
-            scope = f"state {STATE_FIPS}" if STATE_FIPS else "all states"
-            log.info(f"Upserting block_groups_2020 for {scope}...")
+        states_to_run = STATE_FIPS_LIST or _get_all_states(conn)
+
+        for statefp in states_to_run:
+            log.info(f"Starting state {statefp}...")
             t0 = time.time()
-            cur.execute(UPSERT_SQL, {"statefp": STATE_FIPS})
-            inserted = cur.rowcount
+            with conn.cursor() as cur:
+                rows = process_state(cur, statefp, log)
             conn.commit()
             elapsed = time.time() - t0
-            log.info(f"Upsert complete in {elapsed:.1f}s — {inserted:,} rows affected.")
+            log.info(f"State {statefp} done in {elapsed:.1f}s — {rows:,} rows upserted.")
 
+        with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM public.block_groups_2020")
             total = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM public.block_groups_2020 WHERE pop20 = 0")
@@ -182,6 +212,12 @@ def main():
         sys.exit(1)
     finally:
         conn.close()
+
+
+def _get_all_states(conn) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT statefp20 FROM public.blocks_2020 ORDER BY statefp20")
+        return [row[0] for row in cur.fetchall()]
 
 
 if __name__ == "__main__":
