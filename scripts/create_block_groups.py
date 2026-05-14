@@ -20,8 +20,30 @@ Population-weighted centroid:
   lon = SUM(pop20 * intptlon20::float) / SUM(pop20)
   Falls back to geometric centroid of ST_Union when total pop = 0.
 
-The table is created if it does not exist. Processing is county-by-county
-within each state (tqdm progress). Each state is committed as one transaction.
+Goal
+----
+The redistricting algorithm needs a node per census geography with a population
+and a centroid. The finest geography in the database is blocks_2020 (~8M rows),
+which includes geometry, population (pop20), and TIGER internal points
+(intptlat20 / intptlon20). Block groups, tracts, and counties are derived by
+aggregating blocks — no separate TIGER import is required.
+
+This script derives block_groups_2020 from blocks_2020:
+  - Geometry:  ST_Union of all member block geometries.
+  - Population: SUM(pop20) across member blocks.
+  - Centroid:  population-weighted mean of block intptlat20/intptlon20, so
+               the centroid is pulled toward where people actually live rather
+               than the geometric centre of the polygon. Falls back to the
+               geometric centroid for zero-population block groups.
+
+Processing
+----------
+By default, processes all states not yet recorded in block_groups_state_log,
+in FIPS order. Override with STATE_FIPS env var (comma-separated) to target
+specific states. Each state is one transaction. On failure the data is rolled
+back, a 'failed' row is written to block_groups_state_log, and the script
+moves on — that state will not be retried on subsequent runs unless its log
+row is deleted or STATE_FIPS override is used.
 """
 
 import logging
@@ -34,10 +56,8 @@ from pathlib import Path
 import psycopg2
 from tqdm import tqdm
 
-# States to process: Rhode Island (44), Vermont (50), New Hampshire (33).
-# Override with STATE_FIPS env var (comma-separated) or set to empty for all states.
-_env_fips = os.getenv("STATE_FIPS", "50,33")
-STATE_FIPS_LIST: list[str] = [s.strip() for s in _env_fips.split(",") if s.strip()] if _env_fips else []
+_env_fips = os.getenv("STATE_FIPS", "")
+STATE_FIPS_OVERRIDE: list[str] = [s.strip() for s in _env_fips.split(",") if s.strip()]
 
 DB_CRED = {
     "host":     os.getenv("POSTGRES_HOST", "localhost"),
@@ -48,6 +68,13 @@ DB_CRED = {
 }
 
 CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.block_groups_state_log (
+    statefp20   text        NOT NULL PRIMARY KEY,
+    status      text        NOT NULL CHECK (status IN ('done', 'failed')),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    error_msg   text
+);
+
 CREATE TABLE IF NOT EXISTS public.block_groups_2020 (
     geoid20       text                         NOT NULL,
     statefp20     text,
@@ -69,6 +96,26 @@ CREATE INDEX IF NOT EXISTS block_groups_2020_centroid_idx
     ON public.block_groups_2020 USING GIST (centroid_geom);
 CREATE INDEX IF NOT EXISTS block_groups_2020_statefp_idx
     ON public.block_groups_2020 (statefp20);
+"""
+
+# States in blocks_2020 not yet recorded in the state log (neither done nor failed).
+PENDING_STATES_SQL = """
+SELECT DISTINCT b.statefp20
+FROM public.blocks_2020 b
+WHERE NOT EXISTS (
+    SELECT 1 FROM public.block_groups_state_log l
+    WHERE l.statefp20 = b.statefp20
+)
+ORDER BY b.statefp20;
+"""
+
+LOG_STATE_SQL = """
+INSERT INTO public.block_groups_state_log (statefp20, status, updated_at, error_msg)
+VALUES (%(statefp)s, %(status)s, now(), %(error_msg)s)
+ON CONFLICT (statefp20) DO UPDATE SET
+    status     = EXCLUDED.status,
+    updated_at = EXCLUDED.updated_at,
+    error_msg  = EXCLUDED.error_msg;
 """
 
 COUNTIES_SQL = """
@@ -156,7 +203,15 @@ def setup_logging() -> logging.Logger:
     return logger
 
 
+def get_pending_states(conn) -> list[str]:
+    """Return states that exist in blocks_2020 but have no rows in block_groups_2020."""
+    with conn.cursor() as cur:
+        cur.execute(PENDING_STATES_SQL)
+        return [row[0] for row in cur.fetchall()]
+
+
 def process_state(cur, statefp: str, log: logging.Logger) -> int:
+    """Upsert all block groups for one state, county by county. Returns row count."""
     cur.execute(COUNTIES_SQL, {"statefp": statefp})
     counties = [row[0] for row in cur.fetchall()]
     if not counties:
@@ -167,14 +222,11 @@ def process_state(cur, statefp: str, log: logging.Logger) -> int:
     for countyfp in tqdm(counties, desc=f"State {statefp}", unit="county", leave=True):
         cur.execute(UPSERT_COUNTY_SQL, {"statefp": statefp, "countyfp": countyfp})
         total_rows += cur.rowcount
-
     return total_rows
 
 
 def main():
     log = setup_logging()
-    scope = ", ".join(STATE_FIPS_LIST) if STATE_FIPS_LIST else "all states"
-    log.info(f"Processing states: {scope}")
 
     conn = psycopg2.connect(**DB_CRED)
     conn.autocommit = False
@@ -185,16 +237,39 @@ def main():
             cur.execute(CREATE_TABLE_SQL)
             conn.commit()
 
-        states_to_run = STATE_FIPS_LIST or _get_all_states(conn)
+        if STATE_FIPS_OVERRIDE:
+            states_to_run = STATE_FIPS_OVERRIDE
+            log.info(f"Processing specified states: {', '.join(states_to_run)}")
+        else:
+            states_to_run = get_pending_states(conn)
+            log.info(f"Found {len(states_to_run)} pending state(s): {', '.join(states_to_run)}")
+
+        if not states_to_run:
+            log.info("Nothing to do — all states already present in block_groups_2020.")
+            return
+
+        failed: list[str] = []
 
         for statefp in states_to_run:
             log.info(f"Starting state {statefp}...")
             t0 = time.time()
-            with conn.cursor() as cur:
-                rows = process_state(cur, statefp, log)
-            conn.commit()
-            elapsed = time.time() - t0
-            log.info(f"State {statefp} done in {elapsed:.1f}s — {rows:,} rows upserted.")
+            try:
+                with conn.cursor() as cur:
+                    rows = process_state(cur, statefp, log)
+                    cur.execute(LOG_STATE_SQL, {"statefp": statefp, "status": "done", "error_msg": None})
+                # ── state-level transaction commit ──
+                conn.commit()
+                elapsed = time.time() - t0
+                log.info(f"State {statefp} done in {elapsed:.1f}s — {rows:,} rows upserted.")
+            except Exception as e:
+                conn.rollback()
+                elapsed = time.time() - t0
+                log.error(f"State {statefp} failed after {elapsed:.1f}s — {e}. Skipping.")
+                failed.append(statefp)
+                # Write the failure to the log table in its own transaction so it persists.
+                with conn.cursor() as cur:
+                    cur.execute(LOG_STATE_SQL, {"statefp": statefp, "status": "failed", "error_msg": str(e)})
+                conn.commit()
 
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM public.block_groups_2020")
@@ -202,22 +277,14 @@ def main():
             cur.execute("SELECT COUNT(*) FROM public.block_groups_2020 WHERE pop20 = 0")
             zero_pop = cur.fetchone()[0]
             cur.execute("SELECT COUNT(DISTINCT statefp20) FROM public.block_groups_2020")
-            states = cur.fetchone()[0]
+            states_done = cur.fetchone()[0]
 
-        log.info(f"Table totals: rows={total:,} zero_pop={zero_pop:,} states={states}")
+        log.info(f"Table totals: rows={total:,} zero_pop={zero_pop:,} states={states_done}")
+        if failed:
+            log.warning(f"Failed states (not retried): {', '.join(failed)}")
 
-    except Exception as e:
-        conn.rollback()
-        log.exception(f"Fatal error: {e}")
-        sys.exit(1)
     finally:
         conn.close()
-
-
-def _get_all_states(conn) -> list[str]:
-    with conn.cursor() as cur:
-        cur.execute("SELECT DISTINCT statefp20 FROM public.blocks_2020 ORDER BY statefp20")
-        return [row[0] for row in cur.fetchall()]
 
 
 if __name__ == "__main__":
