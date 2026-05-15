@@ -37,7 +37,7 @@ EDGE_WEIGHT_SCALE = 10_000
 
 # Non-adjacent (water-boundary) edges get this multiplier applied to their
 # cost before inversion, making them cheaper for METIS to cut.
-WATER_PENALTY = 3.0
+WATER_PENALTY = 5.0
 
 # Minimum METIS weight so no edge has weight zero.
 MIN_EDGE_WEIGHT = 1

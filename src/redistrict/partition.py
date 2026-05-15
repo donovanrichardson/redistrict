@@ -8,7 +8,9 @@ def partition(
     eweights: list[int],
     nweights: list[int],
     n_parts: int,
-) -> list[int]:
+    ncuts: int = 3,
+    niter: int = 20,
+) -> tuple[int, list[int]]:
     """
     Partition a graph into n_parts using PyMETIS.
 
@@ -22,16 +24,22 @@ def partition(
         Node weights (population). One value per node.
     n_parts:
         Number of partitions (districts).
+    ncuts:
+        Independent partitioning attempts; METIS keeps the best result.
+        METIS default is 1. We default to 3 for better quality.
+    niter:
+        Refinement iterations per uncoarsening stage.
+        METIS default is 10. We default to 20 for better quality.
 
     Returns
     -------
-    membership : list[int]
-        membership[i] is the partition index (0-based) assigned to node i.
+    (edge_cut, membership) where edge_cut is the total weighted cut and
+    membership[i] is the partition index (0-based) assigned to node i.
 
     Raises
     ------
     ValueError
-        If n_parts < 2 or n_parts >= len(nodes).
+        If n_parts < 2 or n_parts >= number of nodes.
     """
     n_nodes = len(adjacency_lists)
     if n_parts < 2:
@@ -41,11 +49,16 @@ def partition(
             f"n_parts ({n_parts}) must be less than the number of nodes ({n_nodes})"
         )
 
-    _cut_count, membership = pymetis.part_graph(
+    # contig only works with k-way (recursive=False). Recursive bisection
+    # ignores the contig flag entirely, producing disconnected districts.
+    options = pymetis.Options(ncuts=ncuts, niter=niter, contig=1, ufactor=8)
+
+    result = pymetis.part_graph(
         n_parts,
         adjacency=adjacency_lists,
         eweights=eweights,
         vweights=nweights,
-        contiguous=True,
+        options=options,
+        recursive=False,
     )
-    return list(membership)
+    return result.edge_cuts, list(result.vertex_part)

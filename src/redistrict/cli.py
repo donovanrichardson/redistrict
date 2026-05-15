@@ -37,52 +37,70 @@ _FIPS_TO_NAME = {
 }
 
 
-def _state_choices(conn) -> list[Choice]:
-    available = db.fetch_available_states(conn)
+_GEOGRAPHY_LABELS = {
+    "tracts":       "Census tracts",
+    "block_groups": "Census block groups",
+    "counties":     "Counties",
+}
+
+
+def _state_choices(conn, geography: str) -> list[Choice]:
+    available = db.fetch_available_states(conn, geography)
     choices = []
-    for fips, _ in available:
+    for fips in available:
         name = _FIPS_TO_NAME.get(fips, fips)
         choices.append(Choice(value=fips, name=f"{name} ({fips})"))
     return choices
 
 
-def _ensure_adjacency(conn, nodes: list[dict]) -> set[tuple[str, str]]:
+def _ensure_adjacency(conn, geography: str, nodes: list[dict]) -> set[tuple[str, str]]:
     geoids = [n["geoid"] for n in nodes]
-    missing = db.get_missing_adjacency_geoids(conn, geoids)
+    missing = db.get_missing_adjacency_geoids(conn, geography, geoids)
+    label = _GEOGRAPHY_LABELS.get(geography, geography)
 
     if missing:
-        print(f"\nCalculating adjacency for {len(missing)} tract(s) "
+        print(f"\nCalculating adjacency for {len(missing)} {label} "
               f"(first time for this state)...")
-        bar = tqdm(total=len(missing), unit="tract", desc="Adjacency")
+        bar = tqdm(total=len(missing), unit=geography, desc="Adjacency")
 
         def _cb(done, total, geoid):
             bar.update(1)
 
-        inserted = db.compute_and_store_adjacency(conn, missing, progress_callback=_cb)
+        inserted = db.compute_and_store_adjacency(
+            conn, geography, missing, progress_callback=_cb
+        )
         bar.close()
         print(f"  Inserted {inserted:,} new adjacency pairs.")
     else:
-        print("Adjacency data already complete for all tracts in this state.")
+        print(f"Adjacency data already complete for all {label} in this state.")
 
-    return db.fetch_adjacency(conn, geoids)
+    return db.fetch_adjacency(conn, geography, geoids)
 
 
-def run(statefp: str, geography: str, n_districts: int) -> None:
+def run(
+    statefp: str,
+    geography: str,
+    n_districts: int,
+    ncuts: int = 3,
+    niter: int = 20,
+) -> None:
     """
     Execute one redistricting run.
 
     Parameters
     ----------
-    statefp:    2-digit FIPS code (e.g. '44' for Rhode Island).
-    geography:  'tracts' (only supported value for now).
+    statefp:     2-digit FIPS code (e.g. '44' for Rhode Island).
+    geography:   'tracts', 'block_groups', or 'counties'.
     n_districts: Number of districts to produce.
+    ncuts:       METIS independent attempts; best result kept (default 3).
+    niter:       METIS refinement iterations per attempt (default 20).
     """
     conn = db.connect()
     try:
-        db.ensure_tables(conn)
+        db.ensure_tables(conn, geography)
 
         print(f"\nFetching {geography} for state {statefp}...")
-        nodes = db.fetch_tracts(conn, statefp)
+        nodes = db.fetch_nodes(conn, geography, statefp)
         if not nodes:
             print(f"No {geography} found for state {statefp}. Is the data loaded?")
             return
@@ -93,7 +111,7 @@ def run(statefp: str, geography: str, n_districts: int) -> None:
                   f"node count ({len(nodes)}).")
             return
 
-        adjacent_pairs = _ensure_adjacency(conn, nodes)
+        adjacent_pairs = _ensure_adjacency(conn, geography, nodes)
         print(f"  {len(adjacent_pairs):,} adjacency pairs loaded.")
 
         print("\nBuilding spherical Delaunay triangulation...")
@@ -109,8 +127,12 @@ def run(statefp: str, geography: str, n_districts: int) -> None:
             nodes, edges, adjacent_pairs
         )
 
-        print(f"\nRunning PyMETIS: {len(nodes)} nodes -> {n_districts} districts...")
-        membership = partition.partition(adj_lists, eweights, nweights, n_districts)
+        print(f"\nRunning PyMETIS: {len(nodes)} nodes -> {n_districts} districts "
+              f"(ncuts={ncuts}, niter={niter})...")
+        edge_cut, membership = partition.partition(
+            adj_lists, eweights, nweights, n_districts, ncuts=ncuts, niter=niter
+        )
+        print(f"  Edge cut weight: {edge_cut:,}")
 
         geoid_to_district = {nodes[i]["geoid"]: membership[i] for i in range(len(nodes))}
 
@@ -127,6 +149,9 @@ def run(statefp: str, geography: str, n_districts: int) -> None:
         params = {
             "water_penalty": graph.WATER_PENALTY,
             "edge_weight_scale": graph.EDGE_WEIGHT_SCALE,
+            "ncuts": ncuts,
+            "niter": niter,
+            "edge_cut": edge_cut,
             "n_nodes": len(nodes),
             "n_edges": len(edges),
             "n_triangles": len(triangles),
@@ -139,32 +164,38 @@ def run(statefp: str, geography: str, n_districts: int) -> None:
         print(f"  Run ID: {run_id}  (redistrict_runs table)")
 
         state_name = _FIPS_TO_NAME.get(statefp, statefp)
-        print(f"\nDone. {state_name}: {n_districts} districts from {len(nodes):,} {geography}.")
+        label = _GEOGRAPHY_LABELS.get(geography, geography)
+        print(f"\nDone. {state_name}: {n_districts} districts from {len(nodes):,} {label}.")
 
     finally:
         conn.close()
 
 
 def main() -> None:
+    geography: str = inquirer.select(
+        message="Select geography level:",
+        choices=[
+            Choice(value="tracts",       name="Census tracts"),
+            Choice(value="block_groups", name="Census block groups"),
+            Choice(value="counties",     name="Counties"),
+        ],
+    ).execute()
+
     conn = db.connect()
     try:
-        db.ensure_tables(conn)
-        state_choices = _state_choices(conn)
+        db.ensure_tables(conn, geography)
+        state_choices = _state_choices(conn, geography)
     finally:
         conn.close()
 
     if not state_choices:
-        print("No states found in the database. Run the aggregation scripts first.")
+        label = _GEOGRAPHY_LABELS.get(geography, geography)
+        print(f"No states found for {label}. Run the aggregation scripts first.")
         sys.exit(1)
 
     statefp: str = inquirer.select(
         message="Select a state:",
         choices=state_choices,
-    ).execute()
-
-    geography: str = inquirer.select(
-        message="Select geography level:",
-        choices=[Choice(value="tracts", name="Census tracts")],
     ).execute()
 
     n_districts_str: str = inquirer.text(
