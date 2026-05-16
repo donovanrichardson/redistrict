@@ -6,23 +6,29 @@ Pipeline:
   2. urquhart_edges                - remove longest edge per Delaunay triangle
   3. build_metis_graph             - produce adjacency lists + integer weights for PyMETIS
 
-Edge weight formula (k-medoids cost):
-    cost(a, b) = dist_km / (2 * sqrt(pop_a)) + dist_km / (2 * sqrt(pop_b))
+Four edge-weight formulas are available via the `formula` parameter:
 
-PyMETIS weight (higher = harder to cut):
-    w_metis(a, b) = round(EDGE_WEIGHT_SCALE / cost(a, b))
+  "original" (default)
+    cost(a,b) = dist/(2*sqrt(pop_a)) + dist/(2*sqrt(pop_b))
+    w = SCALE / cost
 
-For edges that are NOT rook-contiguous (cross water / have no shared boundary),
-the cost is multiplied by WATER_PENALTY before inversion, making those edges
-1/WATER_PENALTY as heavy and therefore easier for METIS to cut.
+  "uniform"
+    All land edges receive weight SCALE. Only the water penalty differentiates.
 
-Example with EDGE_WEIGHT_SCALE=10000, WATER_PENALTY=3:
-  pop_a=4000, pop_b=3600, dist=5 km, land border
-    cost  = 5/(2*63.2) + 5/(2*60.0) = 0.0813
-    w     = 10000 / 0.0813 = 123,000  (hard to cut)
-  Same pair, water border:
-    cost  = 0.0813 * 3 = 0.244
-    w     = 10000 / 0.244 = 41,000   (3x easier to cut)
+  "original_clamped"
+    Adds a constant C to each cost before inversion so that the resulting
+    weight range is exactly 4:1 (w_max = 4 * w_min):
+      C = (cost_max - 4 * cost_min) / 3
+    w = SCALE / (cost + C)
+
+  "blend"
+    Normalises two independent signals each to [0, 0.5] and sums them:
+      component 1: 1/cost_orig  (original formula inverted)
+      component 2: 1/dist_km    (pure inverse distance)
+    w = SCALE * (norm(1/cost_orig) + norm(1/dist_km))
+
+For all formulas, non-rook-contiguous (water) edges are divided by
+WATER_PENALTY after the formula weight is computed.
 """
 
 import math
@@ -143,6 +149,7 @@ def build_metis_graph(
     adjacent_geoid_pairs: set[tuple[str, str]],
     water_penalty: float = WATER_PENALTY,
     scale: int = EDGE_WEIGHT_SCALE,
+    formula: str = "original",
 ) -> tuple[list[list[int]], list[int], list[int]]:
     """
     Build PyMETIS-ready graph structures from nodes and Urquhart edges.
@@ -150,61 +157,97 @@ def build_metis_graph(
     Parameters
     ----------
     nodes:
-        Ordered list of node dicts (geoid, pop, lat, lon). Index in this list
-        is the node index used throughout.
+        Ordered list of node dicts (geoid, pop, lat, lon).
     edges:
         Set of (i, j) pairs with i < j (Urquhart graph).
     adjacent_geoid_pairs:
         Set of (geoid_a, geoid_b) pairs (geoid_a < geoid_b) from rook
-        contiguity. Edges NOT in this set receive the water penalty.
+        contiguity. Edges NOT in this set are divided by water_penalty.
     water_penalty:
-        Cost multiplier for non-rook-contiguous edges (default 3).
+        Divisor applied to non-rook-contiguous edge weights.
     scale:
-        Integer scaling factor for converting float costs to METIS weights.
+        Integer scaling factor.
+    formula:
+        One of "original", "uniform", "original_clamped", "blend".
+        See module docstring for details.
 
     Returns
     -------
     adjacency_lists : list[list[int]]
-        adjacency_lists[i] = list of neighbor indices of node i.
     eweights : list[int]
-        Flat edge-weight list aligned with adjacency_lists.
     nweights : list[int]
-        Node weight = population (min 1).
     """
-    geoid_index = {n["geoid"]: idx for idx, n in enumerate(nodes)}
+    if formula not in ("original", "uniform", "original_clamped", "blend"):
+        raise ValueError(f"Unknown formula {formula!r}")
+
     n = len(nodes)
+    edge_list = sorted(edges)
 
-    # Build symmetric adjacency with weights.
-    # adjacency_map[i][j] = METIS edge weight
-    adjacency_map: list[dict[int, int]] = [{} for _ in range(n)]
-
-    for i, j in edges:
-        dist = haversine_km(
+    # Compute distances once per edge.
+    dists = {
+        (i, j): haversine_km(
             nodes[i]["lat"], nodes[i]["lon"],
             nodes[j]["lat"], nodes[j]["lon"],
         )
-        cost = _edge_cost(nodes, i, j, dist_km=dist)
+        for i, j in edge_list
+    }
 
+    # Compute raw weights (before water penalty).
+    if formula == "uniform":
+        raw: dict[tuple[int, int], float] = {e: float(scale) for e in edge_list}
+
+    elif formula == "original":
+        raw = {
+            e: scale / _edge_cost(nodes, e[0], e[1], dist_km=dists[e])
+            for e in edge_list
+        }
+
+    elif formula == "original_clamped":
+        costs = {e: _edge_cost(nodes, e[0], e[1], dist_km=dists[e]) for e in edge_list}
+        if costs:
+            cmin = min(costs.values())
+            cmax = max(costs.values())
+            # C chosen so w_max / w_min == 4, i.e. (cost_max - 4*cost_min) / 3.
+            c_offset = max(0.0, (cmax - 4.0 * cmin) / 3.0)
+        else:
+            c_offset = 0.0
+        raw = {e: scale / (costs[e] + c_offset) for e in edge_list}
+
+    else:  # "blend"
+        costs = {e: _edge_cost(nodes, e[0], e[1], dist_km=dists[e]) for e in edge_list}
+        w_orig = {e: 1.0 / c for e, c in costs.items()}
+        w_inv  = {e: 1.0 / dists[e] for e in edge_list}
+
+        wo_min, wo_max = min(w_orig.values()), max(w_orig.values())
+        wi_min, wi_max = min(w_inv.values()),  max(w_inv.values())
+
+        raw = {}
+        for e in edge_list:
+            n1 = 0.5 * (w_orig[e] - wo_min) / (wo_max - wo_min) if wo_max > wo_min else 0.25
+            n2 = 0.5 * (w_inv[e]  - wi_min) / (wi_max - wi_min) if wi_max > wi_min else 0.25
+            raw[e] = scale * (n1 + n2)
+
+    # Apply water penalty and build adjacency map.
+    adjacency_map: list[dict[int, int]] = [{} for _ in range(n)]
+    for i, j in edge_list:
         geoid_pair = (
             min(nodes[i]["geoid"], nodes[j]["geoid"]),
             max(nodes[i]["geoid"], nodes[j]["geoid"]),
         )
+        w = raw[(i, j)]
         if geoid_pair not in adjacent_geoid_pairs:
-            cost *= water_penalty
-
-        w = max(MIN_EDGE_WEIGHT, round(scale / cost))
+            w /= water_penalty
+        w = max(MIN_EDGE_WEIGHT, round(w))
         adjacency_map[i][j] = w
         adjacency_map[j][i] = w
 
     adjacency_lists: list[list[int]] = []
     eweights: list[int] = []
-
-    for i in range(n):
-        neighbors = sorted(adjacency_map[i].keys())
+    for idx in range(n):
+        neighbors = sorted(adjacency_map[idx].keys())
         adjacency_lists.append(neighbors)
         for nb in neighbors:
-            eweights.append(adjacency_map[i][nb])
+            eweights.append(adjacency_map[idx][nb])
 
-    nweights = [max(MIN_POP, n["pop"]) for n in nodes]
-
+    nweights = [max(MIN_POP, node["pop"]) for node in nodes]
     return adjacency_lists, eweights, nweights

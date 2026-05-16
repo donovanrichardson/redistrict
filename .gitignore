@@ -1,5 +1,6 @@
 .env
 logs/
+output/**/*.geojson
 __pycache__/
 *.pyc
 *.pyo

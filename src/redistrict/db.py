@@ -269,6 +269,57 @@ def write_assignments(
     conn.commit()
 
 
+def fetch_district_populations(
+    conn: psycopg2.extensions.connection,
+    run_id: int,
+) -> dict[int, int]:
+    """Return {district_id: pop20} for a completed run."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT district_id, pop20
+            FROM public.redistrict_districts
+            WHERE run_id = %s
+            ORDER BY district_id
+            """,
+            (run_id,),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def export_geojson(
+    conn: psycopg2.extensions.connection,
+    run_id: int,
+    output_path: str,
+) -> None:
+    """Write districts for run_id to a GeoJSON FeatureCollection file."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT json_build_object(
+                'type', 'FeatureCollection',
+                'features', json_agg(
+                    json_build_object(
+                        'type', 'Feature',
+                        'geometry', ST_AsGeoJSON(ST_Transform(geom, 4326))::json,
+                        'properties', json_build_object(
+                            'run_id',      run_id,
+                            'district_id', district_id,
+                            'pop20',       pop20
+                        )
+                    )
+                )
+            )
+            FROM public.redistrict_districts
+            WHERE run_id = %s
+            """,
+            (run_id,),
+        )
+        result = cur.fetchone()[0]
+    with open(output_path, "w") as fh:
+        json.dump(result, fh)
+
+
 def write_district_geoms(
     conn: psycopg2.extensions.connection,
     run_id: int,

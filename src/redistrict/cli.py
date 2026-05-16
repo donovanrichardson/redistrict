@@ -83,17 +83,20 @@ def run(
     n_districts: int,
     ncuts: int = 10,
     niter: int = 20,
-) -> None:
+    formula: str = "original",
+) -> int:
     """
-    Execute one redistricting run.
+    Execute one redistricting run and return its run_id.
 
     Parameters
     ----------
     statefp:     2-digit FIPS code (e.g. '44' for Rhode Island).
     geography:   'tracts', 'block_groups', or 'counties'.
     n_districts: Number of districts to produce.
-    ncuts:       METIS independent attempts; best result kept (default 3).
+    ncuts:       METIS independent attempts; best result kept (default 10).
     niter:       METIS refinement iterations per attempt (default 20).
+    formula:     Edge weight formula: "original", "uniform",
+                 "original_clamped", or "blend".
     """
     conn = db.connect()
     try:
@@ -124,7 +127,7 @@ def run(
 
         print("Building METIS graph...")
         adj_lists, eweights, nweights = graph.build_metis_graph(
-            nodes, edges, adjacent_pairs
+            nodes, edges, adjacent_pairs, formula=formula
         )
 
         print(f"\nRunning PyMETIS: {len(nodes)} nodes -> {n_districts} districts "
@@ -149,6 +152,7 @@ def run(
         params = {
             "water_penalty": graph.WATER_PENALTY,
             "edge_weight_scale": graph.EDGE_WEIGHT_SCALE,
+            "formula": formula,
             "ncuts": ncuts,
             "niter": niter,
             "edge_cut": edge_cut,
@@ -166,6 +170,8 @@ def run(
         state_name = _FIPS_TO_NAME.get(statefp, statefp)
         label = _GEOGRAPHY_LABELS.get(geography, geography)
         print(f"\nDone. {state_name}: {n_districts} districts from {len(nodes):,} {label}.")
+
+        return run_id
 
     finally:
         conn.close()
