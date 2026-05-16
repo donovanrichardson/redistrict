@@ -6,23 +6,18 @@ Pipeline:
   2. urquhart_edges                - remove longest edge per Delaunay triangle
   3. build_metis_graph             - produce adjacency lists + integer weights for PyMETIS
 
-Edge weight formula (k-medoids cost):
-    cost(a, b) = dist_km / (2 * sqrt(pop_a)) + dist_km / (2 * sqrt(pop_b))
+Edge weight formula:
+    cost(a, b) = haversine_km(a, b)
 
 PyMETIS weight (higher = harder to cut):
     w_metis(a, b) = round(EDGE_WEIGHT_SCALE / cost(a, b))
 
+Closer nodes get higher weights and are harder for METIS to cut.
+Farther nodes get lower weights and are easier to cut.
+
 For edges that are NOT rook-contiguous (cross water / have no shared boundary),
 the cost is multiplied by WATER_PENALTY before inversion, making those edges
 1/WATER_PENALTY as heavy and therefore easier for METIS to cut.
-
-Example with EDGE_WEIGHT_SCALE=10000, WATER_PENALTY=3:
-  pop_a=4000, pop_b=3600, dist=5 km, land border
-    cost  = 5/(2*63.2) + 5/(2*60.0) = 0.0813
-    w     = 10000 / 0.0813 = 123,000  (hard to cut)
-  Same pair, water border:
-    cost  = 0.0813 * 3 = 0.244
-    w     = 10000 / 0.244 = 41,000   (3x easier to cut)
 """
 
 import math
@@ -122,19 +117,13 @@ def _edge_cost(
     j: int,
     dist_km: float | None = None,
 ) -> float:
-    """
-    k-medoids cost for an edge between nodes i and j.
-
-    cost = dist_km / (2 * sqrt(pop_i)) + dist_km / (2 * sqrt(pop_j))
-    """
+    """Haversine distance in km between nodes i and j."""
     if dist_km is None:
         dist_km = haversine_km(
             nodes[i]["lat"], nodes[i]["lon"],
             nodes[j]["lat"], nodes[j]["lon"],
         )
-    pop_i = max(nodes[i]["pop"], MIN_POP)
-    pop_j = max(nodes[j]["pop"], MIN_POP)
-    return dist_km / (2 * math.sqrt(pop_i)) + dist_km / (2 * math.sqrt(pop_j))
+    return dist_km
 
 
 def build_metis_graph(
