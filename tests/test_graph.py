@@ -144,11 +144,16 @@ class TestEdgeCost:
         cost = _edge_cost(nodes, 0, 1)
         assert cost > 0
 
-    def test_cost_equals_haversine(self):
-        nodes = self._nodes()
-        dist = haversine_km(nodes[0]["lat"], nodes[0]["lon"],
-                            nodes[1]["lat"], nodes[1]["lon"])
-        assert _edge_cost(nodes, 0, 1) == pytest.approx(dist)
+    def test_higher_pop_lower_cost(self):
+        low_pop = [
+            {"geoid": "A", "pop": 100, "lat": 41.70, "lon": -71.55},
+            {"geoid": "B", "pop": 100, "lat": 41.72, "lon": -71.48},
+        ]
+        high_pop = [
+            {"geoid": "A", "pop": 10000, "lat": 41.70, "lon": -71.55},
+            {"geoid": "B", "pop": 10000, "lat": 41.72, "lon": -71.48},
+        ]
+        assert _edge_cost(low_pop, 0, 1) > _edge_cost(high_pop, 0, 1)
 
     def test_longer_distance_higher_cost(self):
         near = [
