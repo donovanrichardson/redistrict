@@ -1,6 +1,7 @@
 .env
 logs/
 output/**/*.geojson
+**/.DS_Store
 __pycache__/
 *.pyc
 *.pyo
