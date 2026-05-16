@@ -81,7 +81,7 @@ def run(
     statefp: str,
     geography: str,
     n_districts: int,
-    ncuts: int = 3,
+    ncuts: int = 10,
     niter: int = 20,
 ) -> None:
     """

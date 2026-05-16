@@ -51,7 +51,7 @@ def partition(
 
     # contig only works with k-way (recursive=False). Recursive bisection
     # ignores the contig flag entirely, producing disconnected districts.
-    options = pymetis.Options(ncuts=ncuts, niter=niter, contig=1, ufactor=8)
+    options = pymetis.Options(ncuts=ncuts, niter=niter, contig=1, ufactor=8, seed=42)
 
     result = pymetis.part_graph(
         n_parts,
