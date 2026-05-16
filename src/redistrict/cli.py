@@ -84,6 +84,7 @@ def run(
     ncuts: int = 10,
     niter: int = 20,
     formula: str = "original",
+    recursive: bool = False,
 ) -> int:
     """
     Execute one redistricting run and return its run_id.
@@ -97,6 +98,7 @@ def run(
     niter:       METIS refinement iterations per attempt (default 20).
     formula:     Edge weight formula: "original", "uniform",
                  "original_clamped", or "blend".
+    recursive:   Use recursive bisection instead of k-way (disables contig).
     """
     conn = db.connect()
     try:
@@ -131,9 +133,10 @@ def run(
         )
 
         print(f"\nRunning PyMETIS: {len(nodes)} nodes -> {n_districts} districts "
-              f"(ncuts={ncuts}, niter={niter})...")
+              f"(ncuts={ncuts}, niter={niter}, recursive={recursive})...")
         edge_cut, membership = partition.partition(
-            adj_lists, eweights, nweights, n_districts, ncuts=ncuts, niter=niter
+            adj_lists, eweights, nweights, n_districts,
+            ncuts=ncuts, niter=niter, recursive=recursive,
         )
         print(f"  Edge cut weight: {edge_cut:,}")
 
@@ -153,6 +156,7 @@ def run(
             "water_penalty": graph.WATER_PENALTY,
             "edge_weight_scale": graph.EDGE_WEIGHT_SCALE,
             "formula": formula,
+            "recursive": recursive,
             "ncuts": ncuts,
             "niter": niter,
             "edge_cut": edge_cut,

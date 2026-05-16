@@ -10,6 +10,7 @@ def partition(
     n_parts: int,
     ncuts: int = 3,
     niter: int = 20,
+    recursive: bool = False,
 ) -> tuple[int, list[int]]:
     """
     Partition a graph into n_parts using PyMETIS.
@@ -30,6 +31,10 @@ def partition(
     niter:
         Refinement iterations per uncoarsening stage.
         METIS default is 10. We default to 20 for better quality.
+    recursive:
+        If True, use recursive bisection instead of k-way. Note: contig
+        enforcement is silently ignored by recursive bisection, so districts
+        may not be contiguous.
 
     Returns
     -------
@@ -49,9 +54,9 @@ def partition(
             f"n_parts ({n_parts}) must be less than the number of nodes ({n_nodes})"
         )
 
-    # contig only works with k-way (recursive=False). Recursive bisection
-    # ignores the contig flag entirely, producing disconnected districts.
-    options = pymetis.Options(ncuts=ncuts, niter=niter, contig=1, ufactor=8, seed=42)
+    # contig only works with k-way. Recursive bisection ignores it.
+    contig = 0 if recursive else 1
+    options = pymetis.Options(ncuts=ncuts, niter=niter, contig=contig, ufactor=8, seed=42)
 
     result = pymetis.part_graph(
         n_parts,
@@ -59,6 +64,6 @@ def partition(
         eweights=eweights,
         vweights=nweights,
         options=options,
-        recursive=False,
+        recursive=recursive,
     )
     return result.edge_cuts, list(result.vertex_part)
