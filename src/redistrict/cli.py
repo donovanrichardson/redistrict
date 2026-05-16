@@ -85,20 +85,22 @@ def run(
     niter: int = 20,
     formula: str = "original",
     recursive: bool = False,
+    water_penalty: float = graph.WATER_PENALTY,
 ) -> int:
     """
     Execute one redistricting run and return its run_id.
 
     Parameters
     ----------
-    statefp:     2-digit FIPS code (e.g. '44' for Rhode Island).
-    geography:   'tracts', 'block_groups', or 'counties'.
-    n_districts: Number of districts to produce.
-    ncuts:       METIS independent attempts; best result kept (default 10).
-    niter:       METIS refinement iterations per attempt (default 20).
-    formula:     Edge weight formula: "original", "uniform",
-                 "original_clamped", or "blend".
-    recursive:   Use recursive bisection instead of k-way (disables contig).
+    statefp:       2-digit FIPS code (e.g. '44' for Rhode Island).
+    geography:     'tracts', 'block_groups', or 'counties'.
+    n_districts:   Number of districts to produce.
+    ncuts:         METIS independent attempts; best result kept (default 10).
+    niter:         METIS refinement iterations per attempt (default 20).
+    formula:       Edge weight formula: "original", "uniform",
+                   "original_clamped", or "blend".
+    recursive:     Use recursive bisection instead of k-way (disables contig).
+    water_penalty: Divisor applied to non-rook-contiguous edge weights.
     """
     conn = db.connect()
     try:
@@ -129,7 +131,8 @@ def run(
 
         print("Building METIS graph...")
         adj_lists, eweights, nweights = graph.build_metis_graph(
-            nodes, edges, adjacent_pairs, formula=formula
+            nodes, edges, adjacent_pairs,
+            water_penalty=water_penalty, formula=formula,
         )
 
         print(f"\nRunning PyMETIS: {len(nodes)} nodes -> {n_districts} districts "
@@ -153,7 +156,7 @@ def run(
             print(f"  District {d}: {pop_per_district[d]:,}  ({pct_dev:+.1f}% from ideal)")
 
         params = {
-            "water_penalty": graph.WATER_PENALTY,
+            "water_penalty": water_penalty,
             "edge_weight_scale": graph.EDGE_WEIGHT_SCALE,
             "formula": formula,
             "recursive": recursive,
