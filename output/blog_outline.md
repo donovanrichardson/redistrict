@@ -47,8 +47,9 @@
 ## Results
 
 - New York (26 districts, block groups): uniform + 8× water penalty + QGIS-curated water links gives clean, compact districts respecting borough and county boundaries where population allows.
-- All 44 continental states with ≥2 congressional seats run successfully with the same settings — maps produced in a single overnight batch.
-- Zero-population units (parks, water, industrial) are correctly excluded from the partitioning graph and post-assigned to their nearest populated neighbour.
+- All 41 continental states with ≥2 congressional seats ran successfully with the same settings (runs 45–85), maps produced in a single batch. 7 states skipped — all have only 1 House seat (Delaware, DC, Montana, North Dakota, South Dakota, Vermont, Wyoming).
+- 38 of 41 states achieve worst-case deviation ≤0.8%. Ohio reaches 1.7%; California 8.9% and Texas 14.3% are outliers — both have very large-population urban block groups that create a hard floor on achievable balance at this geography level.
+- Zero-population units (parks, water, industrial) — ranging from 0 (Nebraska, West Virginia) to 170 (Michigan) per state — are correctly excluded from the partitioning graph and post-assigned to their nearest populated neighbour.
 
 ## What this doesn't do (yet)
 
