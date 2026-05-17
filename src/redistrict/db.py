@@ -1,6 +1,7 @@
 """Database access: connection, adjacency management, results persistence."""
 
 import json
+import math
 import os
 
 import psycopg2
@@ -41,6 +42,22 @@ CREATE TABLE IF NOT EXISTS public.redistrict_assignments (
     district_id integer NOT NULL,
     PRIMARY KEY (run_id, geoid20)
 );
+
+CREATE TABLE IF NOT EXISTS public.redistrict_edges (
+    id          serial  PRIMARY KEY,
+    run_id      integer NOT NULL REFERENCES public.redistrict_runs(id),
+    geoid_a     text    NOT NULL,
+    geoid_b     text    NOT NULL,
+    is_adjacent boolean NOT NULL,
+    dist_km     float,
+    geom        geometry(LineString, 4326),
+    UNIQUE (run_id, geoid_a, geoid_b),
+    CHECK (geoid_a < geoid_b)
+);
+CREATE INDEX IF NOT EXISTS redistrict_edges_run_idx
+    ON public.redistrict_edges (run_id);
+CREATE INDEX IF NOT EXISTS redistrict_edges_nonadj_idx
+    ON public.redistrict_edges (run_id) WHERE NOT is_adjacent;
 """
 
 
@@ -267,6 +284,100 @@ def write_assignments(
             rows,
         )
     conn.commit()
+
+
+def fetch_run(
+    conn: psycopg2.extensions.connection,
+    run_id: int,
+) -> dict:
+    """Return the run record for run_id as a dict, or raise ValueError."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT geography, statefp20, n_districts, params
+            FROM public.redistrict_runs
+            WHERE id = %s
+            """,
+            (run_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"No run found with id={run_id}")
+    return {
+        "geography":   row[0],
+        "statefp":     row[1],
+        "n_districts": row[2],
+        "params":      row[3] or {},
+    }
+
+
+def write_edges(
+    conn: psycopg2.extensions.connection,
+    run_id: int,
+    nodes: list[dict],
+    edges: set[tuple[int, int]],
+    adjacent_geoid_pairs: set[tuple[str, str]],
+) -> int:
+    """
+    Insert all Urquhart edges for a run with an is_adjacent flag.
+
+    Each edge becomes a LineString between the two node centroids (EPSG:4326).
+    Returns the number of rows inserted.
+    """
+    with conn.cursor() as cur:
+        for i, j in edges:
+            ga = min(nodes[i]["geoid"], nodes[j]["geoid"])
+            gb = max(nodes[i]["geoid"], nodes[j]["geoid"])
+            is_adj = (ga, gb) in adjacent_geoid_pairs
+            loni, lati = nodes[i]["lon"], nodes[i]["lat"]
+            lonj, latj = nodes[j]["lon"], nodes[j]["lat"]
+            dlat = math.radians(latj - lati)
+            dlon = math.radians(lonj - loni)
+            a = (math.sin(dlat / 2) ** 2
+                 + math.cos(math.radians(lati)) * math.cos(math.radians(latj))
+                 * math.sin(dlon / 2) ** 2)
+            dist_km = 2 * 6371.0 * math.asin(math.sqrt(a))
+            cur.execute(
+                """
+                INSERT INTO public.redistrict_edges
+                    (run_id, geoid_a, geoid_b, is_adjacent, dist_km, geom)
+                VALUES (%s, %s, %s, %s, %s,
+                    ST_SetSRID(ST_MakeLine(
+                        ST_Point(%s, %s),
+                        ST_Point(%s, %s)
+                    ), 4326))
+                ON CONFLICT (run_id, geoid_a, geoid_b) DO NOTHING
+                """,
+                (run_id, ga, gb, is_adj, dist_km, loni, lati, lonj, latj),
+            )
+    conn.commit()
+    return len(edges)
+
+
+def fetch_edges(
+    conn: psycopg2.extensions.connection,
+    run_id: int,
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """
+    Return all remaining edges for run_id as two sets of geoid pairs:
+      (adjacent_pairs, non_adjacent_pairs)
+
+    Non-adjacent edges may have been deleted by the user in QGIS.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT geoid_a, geoid_b, is_adjacent
+            FROM public.redistrict_edges
+            WHERE run_id = %s
+            """,
+            (run_id,),
+        )
+        adjacent: set[tuple[str, str]] = set()
+        non_adjacent: set[tuple[str, str]] = set()
+        for geoid_a, geoid_b, is_adj in cur.fetchall():
+            (adjacent if is_adj else non_adjacent).add((geoid_a, geoid_b))
+    return adjacent, non_adjacent
 
 
 def fetch_district_populations(

@@ -2,7 +2,8 @@
 Redistricting CLI.
 
 Usage:
-    redistrict          (interactive prompts)
+    redistrict                      (interactive prompts)
+    redistrict --continue <run_id>  (re-run with curated water links)
     redistrict --help
 """
 
@@ -129,6 +130,13 @@ def run(
         edges = graph.urquhart_edges(nodes, triangles)
         print(f"  {len(edges):,} edges.")
 
+        n_water = sum(
+            1 for i, j in edges
+            if (min(nodes[i]["geoid"], nodes[j]["geoid"]),
+                max(nodes[i]["geoid"], nodes[j]["geoid"])) not in adjacent_pairs
+        )
+        print(f"  {n_water:,} non-adjacent (water) edges.")
+
         print("Building METIS graph...")
         adj_lists, eweights, nweights = graph.build_metis_graph(
             nodes, edges, adjacent_pairs,
@@ -156,23 +164,26 @@ def run(
             print(f"  District {d}: {pop_per_district[d]:,}  ({pct_dev:+.1f}% from ideal)")
 
         params = {
-            "water_penalty": water_penalty,
+            "water_penalty":    water_penalty,
             "edge_weight_scale": graph.EDGE_WEIGHT_SCALE,
-            "formula": formula,
-            "recursive": recursive,
-            "ncuts": ncuts,
-            "niter": niter,
-            "edge_cut": edge_cut,
-            "n_nodes": len(nodes),
-            "n_edges": len(edges),
-            "n_triangles": len(triangles),
+            "formula":          formula,
+            "recursive":        recursive,
+            "ncuts":            ncuts,
+            "niter":            niter,
+            "edge_cut":         edge_cut,
+            "n_nodes":          len(nodes),
+            "n_edges":          len(edges),
+            "n_water_edges":    n_water,
+            "n_triangles":      len(triangles),
         }
 
         print("\nWriting results to database...")
         run_id = db.write_run(conn, geography, statefp, n_districts, params)
         db.write_assignments(conn, run_id, geoid_to_district)
         db.write_district_geoms(conn, run_id, geography, geoid_to_district)
+        db.write_edges(conn, run_id, nodes, edges, adjacent_pairs)
         print(f"  Run ID: {run_id}  (redistrict_runs table)")
+        print(f"  {n_water:,} non-adjacent edges saved (filter in QGIS, then --continue {run_id})")
 
         state_name = _FIPS_TO_NAME.get(statefp, statefp)
         label = _GEOGRAPHY_LABELS.get(geography, geography)
@@ -184,7 +195,128 @@ def run(
         conn.close()
 
 
+def continue_run(parent_run_id: int) -> int:
+    """
+    Re-run using edges stored in redistrict_edges for parent_run_id.
+
+    The user has opened the run in QGIS, filtered to is_adjacent=false,
+    and deleted the non-adjacent edges they don't want. This function
+    reads whatever edges remain, applies the water penalty to non-adjacent
+    ones, checks connectivity, then runs METIS with the same parameters.
+    Saves as a new run referencing the parent. No Urquhart recomputation.
+
+    Returns the new run_id.
+    """
+    conn = db.connect()
+    try:
+        parent = db.fetch_run(conn, parent_run_id)
+        geography   = parent["geography"]
+        statefp     = parent["statefp"]
+        n_districts = parent["n_districts"]
+        params_orig = parent["params"]
+
+        db.ensure_tables(conn, geography)
+
+        print(f"\nLoading edges from run {parent_run_id}...")
+        adj_geoid_pairs, non_adj_geoid_pairs = db.fetch_edges(conn, parent_run_id)
+        n_orig_nonadj = params_orig.get("n_water_edges", len(non_adj_geoid_pairs))
+        n_removed = n_orig_nonadj - len(non_adj_geoid_pairs)
+        print(f"  {len(adj_geoid_pairs):,} adjacent edges.")
+        print(f"  {len(non_adj_geoid_pairs):,} non-adjacent edges kept "
+              f"({n_removed} removed by user).")
+
+        nodes = db.fetch_nodes(conn, geography, statefp)
+        geoid_to_idx = {n["geoid"]: i for i, n in enumerate(nodes)}
+
+        # Rebuild index-pair edge set from geoid pairs.
+        all_geoid_pairs = adj_geoid_pairs | non_adj_geoid_pairs
+        edges: set[tuple[int, int]] = set()
+        for ga, gb in all_geoid_pairs:
+            if ga in geoid_to_idx and gb in geoid_to_idx:
+                i, j = geoid_to_idx[ga], geoid_to_idx[gb]
+                edges.add((min(i, j), max(i, j)))
+
+        # Connectivity check.
+        components = graph.check_connectivity(nodes, edges)
+        if len(components) > 1:
+            sizes = sorted((len(c) for c in components), reverse=True)
+            print(f"\nWARNING: graph has {len(components)} disconnected components "
+                  f"(sizes: {sizes}).")
+            print("  METIS contig enforcement may produce non-contiguous districts.")
+            answer = input("  Proceed anyway? [y/N] ").strip().lower()
+            if answer != "y":
+                print("Aborted.")
+                return -1
+
+        formula       = params_orig.get("formula", "original")
+        recursive     = params_orig.get("recursive", False)
+        water_penalty = params_orig.get("water_penalty", graph.WATER_PENALTY)
+        ncuts         = params_orig.get("ncuts", 10)
+        niter         = params_orig.get("niter", 20)
+
+        print("Building METIS graph...")
+        adj_lists, eweights, nweights = graph.build_metis_graph(
+            nodes, edges, adj_geoid_pairs,
+            water_penalty=water_penalty, formula=formula,
+        )
+
+        print(f"\nRunning PyMETIS: {len(nodes)} nodes -> {n_districts} districts "
+              f"(ncuts={ncuts}, niter={niter}, recursive={recursive})...")
+        edge_cut, membership = partition.partition(
+            adj_lists, eweights, nweights, n_districts,
+            ncuts=ncuts, niter=niter, recursive=recursive,
+        )
+        print(f"  Edge cut weight: {edge_cut:,}")
+
+        geoid_to_district = {nodes[i]["geoid"]: membership[i] for i in range(len(nodes))}
+
+        pop_per_district: dict[int, int] = {}
+        for i, d in enumerate(membership):
+            pop_per_district[d] = pop_per_district.get(d, 0) + nodes[i]["pop"]
+        total_pop = sum(nweights)
+        ideal = total_pop / n_districts
+        print("\nDistrict populations:")
+        for d in sorted(pop_per_district):
+            pct_dev = 100 * (pop_per_district[d] - ideal) / ideal
+            print(f"  District {d}: {pop_per_district[d]:,}  ({pct_dev:+.1f}% from ideal)")
+
+        params = {
+            **params_orig,
+            "parent_run_id":        parent_run_id,
+            "non_adj_edges_kept":   len(non_adj_geoid_pairs),
+            "non_adj_edges_removed": n_removed,
+            "edge_cut":             edge_cut,
+            "n_edges":              len(edges),
+        }
+
+        print("\nWriting results to database...")
+        run_id = db.write_run(conn, geography, statefp, n_districts, params)
+        db.write_assignments(conn, run_id, geoid_to_district)
+        db.write_district_geoms(conn, run_id, geography, geoid_to_district)
+        db.write_edges(conn, run_id, nodes, edges, adj_geoid_pairs)
+        print(f"  Run ID: {run_id}  (parent: {parent_run_id})")
+
+        state_name = _FIPS_TO_NAME.get(statefp, statefp)
+        label = _GEOGRAPHY_LABELS.get(geography, geography)
+        print(f"\nDone. {state_name}: {n_districts} districts from {len(nodes):,} {label}.")
+        return run_id
+
+    finally:
+        conn.close()
+
+
 def main() -> None:
+    # Handle --continue <run_id> before entering interactive mode.
+    if "--continue" in sys.argv:
+        idx = sys.argv.index("--continue")
+        try:
+            run_id = int(sys.argv[idx + 1])
+        except (IndexError, ValueError):
+            print("Usage: redistrict --continue <run_id>")
+            sys.exit(1)
+        continue_run(run_id)
+        return
+
     geography: str = inquirer.select(
         message="Select geography level:",
         choices=[

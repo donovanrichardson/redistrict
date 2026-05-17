@@ -143,6 +143,40 @@ def _edge_cost(
     return dist_km / (2 * math.sqrt(pop_i)) + dist_km / (2 * math.sqrt(pop_j))
 
 
+def check_connectivity(
+    nodes: Sequence[dict],
+    edges: set[tuple[int, int]],
+) -> list[list[int]]:
+    """
+    Return connected components as lists of node indices.
+
+    A single-element list means the graph is fully connected.
+    Multiple elements means the graph is disconnected — METIS contig will fail.
+    """
+    n = len(nodes)
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for i, j in edges:
+        adj[i].append(j)
+        adj[j].append(i)
+
+    visited = [False] * n
+    components: list[list[int]] = []
+    for start in range(n):
+        if visited[start]:
+            continue
+        component: list[int] = []
+        stack = [start]
+        while stack:
+            v = stack.pop()
+            if visited[v]:
+                continue
+            visited[v] = True
+            component.append(v)
+            stack.extend(adj[v])
+        components.append(component)
+    return components
+
+
 def build_metis_graph(
     nodes: Sequence[dict],
     edges: set[tuple[int, int]],
