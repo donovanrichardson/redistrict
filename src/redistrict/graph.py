@@ -143,6 +143,76 @@ def _edge_cost(
     return dist_km / (2 * math.sqrt(pop_i)) + dist_km / (2 * math.sqrt(pop_j))
 
 
+def _nearest_in_set(
+    u: int,
+    candidates: list[int],
+    nodes: Sequence[dict],
+) -> tuple[int, float]:
+    """
+    Return (v, dist_km) for the candidate node closest to u by haversine,
+    pre-filtered to ~1% of candidates via a 2-pass bounding-box sort.
+
+    Pass 1: keep the closest sqrt(0.01) fraction by |lat| difference.
+    Pass 2: keep the closest sqrt(0.01) fraction of those by |lon| difference.
+    Haversine is computed only on the remaining ~1% subset.
+    """
+    frac = math.sqrt(0.01)
+    lat_u = nodes[u]["lat"]
+    lon_u = nodes[u]["lon"]
+
+    k_lat = max(1, math.ceil(frac * len(candidates)))
+    by_lat = sorted(candidates, key=lambda v: abs(nodes[v]["lat"] - lat_u))[:k_lat]
+
+    k_lon = max(1, math.ceil(frac * len(by_lat)))
+    by_lon = sorted(by_lat, key=lambda v: abs(nodes[v]["lon"] - lon_u))[:k_lon]
+
+    best_v, best_d = -1, float("inf")
+    for v in by_lon:
+        d = haversine_km(lat_u, lon_u, nodes[v]["lat"], nodes[v]["lon"])
+        if d < best_d:
+            best_d, best_v = d, v
+    return best_v, best_d
+
+
+def reconnect_components(
+    nodes: Sequence[dict],
+    components: list[list[int]],
+) -> set[tuple[int, int]]:
+    """
+    Return the minimum set of bridging edges needed to make the graph connected.
+
+    For each disconnected component, finds the closest node pair between that
+    component and the already-connected nodes and adds one bridge edge. All
+    returned edges should be treated as non-adjacent (water) by the caller.
+    """
+    if len(components) <= 1:
+        return set()
+
+    components = sorted(components, key=len, reverse=True)
+    connected: list[int] = list(components[0])
+    remaining = [list(c) for c in components[1:]]
+    new_edges: set[tuple[int, int]] = set()
+
+    while remaining:
+        best_dist = float("inf")
+        best_edge: tuple[int, int] = (-1, -1)
+        best_idx = 0
+
+        for idx, comp in enumerate(remaining):
+            for u in comp:
+                v, d = _nearest_in_set(u, connected, nodes)
+                if d < best_dist:
+                    best_dist = d
+                    best_edge = (min(u, v), max(u, v))
+                    best_idx = idx
+
+        new_edges.add(best_edge)
+        connected.extend(remaining[best_idx])
+        remaining.pop(best_idx)
+
+    return new_edges
+
+
 def check_connectivity(
     nodes: Sequence[dict],
     edges: set[tuple[int, int]],

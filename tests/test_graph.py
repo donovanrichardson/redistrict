@@ -12,6 +12,7 @@ from redistrict.graph import (
     build_metis_graph,
     check_connectivity,
     haversine_km,
+    reconnect_components,
     spherical_delaunay_triangles,
     urquhart_edges,
 )
@@ -271,3 +272,56 @@ class TestCheckConnectivity:
         nodes = self._nodes(3)
         components = check_connectivity(nodes, set())
         assert len(components) == 3
+
+
+# ---------------------------------------------------------------------------
+# reconnect_components
+# ---------------------------------------------------------------------------
+
+class TestReconnectComponents:
+    def _geo_nodes(self):
+        # Spread across RI for realistic haversine distances
+        return [
+            {"geoid": "A", "pop": 100, "lat": 41.70, "lon": -71.55},
+            {"geoid": "B", "pop": 100, "lat": 41.72, "lon": -71.48},
+            {"geoid": "C", "pop": 100, "lat": 41.76, "lon": -71.45},
+            {"geoid": "D", "pop": 100, "lat": 41.80, "lon": -71.50},
+            {"geoid": "E", "pop": 100, "lat": 41.83, "lon": -71.57},
+        ]
+
+    def test_already_connected_returns_empty(self):
+        nodes = self._geo_nodes()
+        components = [[0, 1, 2, 3, 4]]
+        bridges = reconnect_components(nodes, components)
+        assert bridges == set()
+
+    def test_two_components_returns_one_bridge(self):
+        nodes = self._geo_nodes()
+        components = [[0, 1, 2], [3, 4]]
+        bridges = reconnect_components(nodes, components)
+        assert len(bridges) == 1
+
+    def test_bridge_connects_components(self):
+        nodes = self._geo_nodes()
+        components = [[0, 1, 2], [3, 4]]
+        bridges = reconnect_components(nodes, components)
+        edge = next(iter(bridges))
+        # One node from each component
+        i, j = edge
+        assert (i in {0, 1, 2}) != (j in {0, 1, 2})
+
+    def test_three_components_returns_two_bridges(self):
+        nodes = self._geo_nodes()
+        components = [[0, 1], [2, 3], [4]]
+        bridges = reconnect_components(nodes, components)
+        assert len(bridges) == 2
+
+    def test_result_makes_graph_connected(self):
+        nodes = self._geo_nodes()
+        components = [[0, 1], [2], [3, 4]]
+        bridges = reconnect_components(nodes, components)
+        all_edges = bridges.copy()
+        # Add original intra-component edges
+        all_edges |= {(0, 1), (3, 4)}
+        final_components = check_connectivity(nodes, all_edges)
+        assert len(final_components) == 1

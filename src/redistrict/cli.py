@@ -211,17 +211,23 @@ def continue_run(parent_run_id: int) -> int:
                 i, j = geoid_to_idx[ga], geoid_to_idx[gb]
                 edges.add((min(i, j), max(i, j)))
 
-        # Connectivity check.
+        # Connectivity check — auto-bridge any disconnected components.
         components = graph.check_connectivity(nodes, edges)
         if len(components) > 1:
             sizes = sorted((len(c) for c in components), reverse=True)
-            print(f"\nWARNING: graph has {len(components)} disconnected components "
-                  f"(sizes: {sizes}).")
-            print("  METIS contig enforcement may produce non-contiguous districts.")
-            answer = input("  Proceed anyway? [y/N] ").strip().lower()
-            if answer != "y":
-                print("Aborted.")
-                return -1
+            print(f"\n  Graph has {len(components)} disconnected components "
+                  f"(sizes: {sizes}). Auto-connecting...")
+            bridges = graph.reconnect_components(nodes, components)
+            for i, j in bridges:
+                ga = min(nodes[i]["geoid"], nodes[j]["geoid"])
+                gb = max(nodes[i]["geoid"], nodes[j]["geoid"])
+                d = graph.haversine_km(
+                    nodes[i]["lat"], nodes[i]["lon"],
+                    nodes[j]["lat"], nodes[j]["lon"],
+                )
+                print(f"    Bridge: {ga} — {gb}  ({d:.1f} km, non-adjacent)")
+                non_adj_geoid_pairs.add((ga, gb))
+            edges |= bridges
 
         formula       = params_orig.get("formula", "original")
         recursive     = params_orig.get("recursive", False)
