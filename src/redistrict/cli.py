@@ -177,7 +177,13 @@ def run(
         conn.close()
 
 
-def continue_run(parent_run_id: int) -> int:
+def continue_run(
+    parent_run_id: int,
+    formula: str | None = None,
+    water_penalty: float | None = None,
+    ncuts: int | None = None,
+    niter: int | None = None,
+) -> int:
     """
     Re-run using edges stored in redistrict_edges for parent_run_id.
 
@@ -186,6 +192,8 @@ def continue_run(parent_run_id: int) -> int:
     reads whatever edges remain, applies the water penalty to non-adjacent
     ones, checks connectivity, then runs METIS with the same parameters.
     Saves as a new run referencing the parent. No Urquhart recomputation.
+
+    Optional keyword arguments override the stored params from the parent run.
 
     Returns the new run_id.
     """
@@ -241,11 +249,11 @@ def continue_run(parent_run_id: int) -> int:
                 non_adj_geoid_pairs.add((ga, gb))
             edges |= bridges
 
-        formula       = params_orig.get("formula", "original")
+        formula       = formula       if formula       is not None else params_orig.get("formula", "original")
         recursive     = params_orig.get("recursive", False)
-        water_penalty = params_orig.get("water_penalty", graph.WATER_PENALTY)
-        ncuts         = params_orig.get("ncuts", 10)
-        niter         = params_orig.get("niter", 20)
+        water_penalty = water_penalty if water_penalty is not None else params_orig.get("water_penalty", graph.WATER_PENALTY)
+        ncuts         = ncuts         if ncuts         is not None else params_orig.get("ncuts", 10)
+        niter         = niter         if niter         is not None else params_orig.get("niter", 20)
 
         print("Building METIS graph...")
         adj_lists, eweights, nweights = graph.build_metis_graph(
@@ -308,6 +316,18 @@ def continue_run(parent_run_id: int) -> int:
         conn.close()
 
 
+def _parse_flag(flag: str, cast):
+    """Return cast(value) for --flag value in sys.argv, or None if absent."""
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        try:
+            return cast(sys.argv[i + 1])
+        except (IndexError, ValueError):
+            print(f"Usage: redistrict --continue <run_id> [{flag} <value>]")
+            sys.exit(1)
+    return None
+
+
 def main() -> None:
     # Handle --continue <run_id> before entering interactive mode.
     if "--continue" in sys.argv:
@@ -315,9 +335,16 @@ def main() -> None:
         try:
             run_id = int(sys.argv[idx + 1])
         except (IndexError, ValueError):
-            print("Usage: redistrict --continue <run_id>")
+            print("Usage: redistrict --continue <run_id> [--formula <f>] "
+                  "[--water-penalty <w>] [--ncuts <n>] [--niter <n>]")
             sys.exit(1)
-        continue_run(run_id)
+        continue_run(
+            run_id,
+            formula=_parse_flag("--formula", str),
+            water_penalty=_parse_flag("--water-penalty", float),
+            ncuts=_parse_flag("--ncuts", int),
+            niter=_parse_flag("--niter", int),
+        )
         return
 
     geography: str = inquirer.select(
