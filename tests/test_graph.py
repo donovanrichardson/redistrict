@@ -10,6 +10,7 @@ from redistrict.graph import (
     WATER_PENALTY,
     _edge_cost,
     build_metis_graph,
+    check_connectivity,
     haversine_km,
     spherical_delaunay_triangles,
     urquhart_edges,
@@ -228,3 +229,45 @@ class TestBuildMetisGraph:
         edges = self._edges()
         adj, ew, _ = build_metis_graph(nodes, edges, set())
         assert all(w >= MIN_EDGE_WEIGHT for w in ew)
+
+
+# ---------------------------------------------------------------------------
+# check_connectivity
+# ---------------------------------------------------------------------------
+
+class TestCheckConnectivity:
+    def _nodes(self, n: int):
+        return [{"geoid": str(i), "pop": 100, "lat": 41.0 + i * 0.01, "lon": -71.0}
+                for i in range(n)]
+
+    def test_fully_connected_single_component(self):
+        nodes = self._nodes(4)
+        edges = {(0, 1), (1, 2), (2, 3)}
+        components = check_connectivity(nodes, edges)
+        assert len(components) == 1
+        assert len(components[0]) == 4
+
+    def test_two_components(self):
+        nodes = self._nodes(4)
+        edges = {(0, 1), (2, 3)}  # two disconnected pairs
+        components = check_connectivity(nodes, edges)
+        assert len(components) == 2
+        sizes = sorted(len(c) for c in components)
+        assert sizes == [2, 2]
+
+    def test_isolated_node_is_its_own_component(self):
+        nodes = self._nodes(3)
+        edges = {(0, 1)}  # node 2 is isolated
+        components = check_connectivity(nodes, edges)
+        assert len(components) == 2
+
+    def test_complete_graph_single_component(self):
+        nodes = self._nodes(4)
+        edges = {(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)}
+        components = check_connectivity(nodes, edges)
+        assert len(components) == 1
+
+    def test_empty_edges_all_isolated(self):
+        nodes = self._nodes(3)
+        components = check_connectivity(nodes, set())
+        assert len(components) == 3

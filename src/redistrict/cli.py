@@ -137,57 +137,32 @@ def run(
         )
         print(f"  {n_water:,} non-adjacent (water) edges.")
 
-        print("Building METIS graph...")
-        adj_lists, eweights, nweights = graph.build_metis_graph(
-            nodes, edges, adjacent_pairs,
-            water_penalty=water_penalty, formula=formula,
-        )
-
-        print(f"\nRunning PyMETIS: {len(nodes)} nodes -> {n_districts} districts "
-              f"(ncuts={ncuts}, niter={niter}, recursive={recursive})...")
-        edge_cut, membership = partition.partition(
-            adj_lists, eweights, nweights, n_districts,
-            ncuts=ncuts, niter=niter, recursive=recursive,
-        )
-        print(f"  Edge cut weight: {edge_cut:,}")
-
-        geoid_to_district = {nodes[i]["geoid"]: membership[i] for i in range(len(nodes))}
-
-        pop_per_district: dict[int, int] = {}
-        for i, d in enumerate(membership):
-            pop_per_district[d] = pop_per_district.get(d, 0) + nodes[i]["pop"]
-        total_pop = sum(nweights)
-        ideal = total_pop / n_districts
-        print("\nDistrict populations:")
-        for d in sorted(pop_per_district):
-            pct_dev = 100 * (pop_per_district[d] - ideal) / ideal
-            print(f"  District {d}: {pop_per_district[d]:,}  ({pct_dev:+.1f}% from ideal)")
-
         params = {
+            "status":           "pending",
             "water_penalty":    water_penalty,
             "edge_weight_scale": graph.EDGE_WEIGHT_SCALE,
             "formula":          formula,
             "recursive":        recursive,
             "ncuts":            ncuts,
             "niter":            niter,
-            "edge_cut":         edge_cut,
             "n_nodes":          len(nodes),
             "n_edges":          len(edges),
             "n_water_edges":    n_water,
             "n_triangles":      len(triangles),
         }
 
-        print("\nWriting results to database...")
+        print("\nSaving edges to database...")
         run_id = db.write_run(conn, geography, statefp, n_districts, params)
-        db.write_assignments(conn, run_id, geoid_to_district)
-        db.write_district_geoms(conn, run_id, geography, geoid_to_district)
         db.write_edges(conn, run_id, nodes, edges, adjacent_pairs)
-        print(f"  Run ID: {run_id}  (redistrict_runs table)")
-        print(f"  {n_water:,} non-adjacent edges saved (filter in QGIS, then --continue {run_id})")
 
         state_name = _FIPS_TO_NAME.get(statefp, statefp)
         label = _GEOGRAPHY_LABELS.get(geography, geography)
-        print(f"\nDone. {state_name}: {n_districts} districts from {len(nodes):,} {label}.")
+        print(f"\n{state_name}: {len(nodes):,} {label}, {len(edges):,} edges saved.")
+        print(f"\nNext steps:")
+        print(f"  1. Open QGIS and filter redistrict_edges:")
+        print(f'       "run_id" = {run_id} AND NOT "is_adjacent"')
+        print(f"  2. Delete the non-adjacent edges you don't want.")
+        print(f"  3. Run:  redistrict --continue {run_id}")
 
         return run_id
 
@@ -294,6 +269,7 @@ def continue_run(parent_run_id: int) -> int:
         db.write_assignments(conn, run_id, geoid_to_district)
         db.write_district_geoms(conn, run_id, geography, geoid_to_district)
         db.write_edges(conn, run_id, nodes, edges, adj_geoid_pairs)
+        db.update_run_params(conn, parent_run_id, {"continued_as": run_id})
         print(f"  Run ID: {run_id}  (parent: {parent_run_id})")
 
         state_name = _FIPS_TO_NAME.get(statefp, statefp)

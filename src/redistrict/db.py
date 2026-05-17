@@ -380,6 +380,24 @@ def fetch_edges(
     return adjacent, non_adjacent
 
 
+def update_run_params(
+    conn: psycopg2.extensions.connection,
+    run_id: int,
+    updates: dict,
+) -> None:
+    """Merge updates into the params jsonb of an existing run record."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.redistrict_runs
+            SET params = params || %s::jsonb
+            WHERE id = %s
+            """,
+            (json.dumps(updates), run_id),
+        )
+    conn.commit()
+
+
 def fetch_district_populations(
     conn: psycopg2.extensions.connection,
     run_id: int,
