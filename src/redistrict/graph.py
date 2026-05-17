@@ -174,6 +174,37 @@ def _nearest_in_set(
     return best_v, best_d
 
 
+def nearest_node(
+    target: dict,
+    candidates: list[dict],
+) -> int:
+    """
+    Return the index in candidates of the node closest to target by haversine.
+
+    Uses the same bounding-box pre-filter as _nearest_in_set: keeps the
+    closest sqrt(0.01) fraction by |lat|, then sqrt(0.01) of those by |lon|,
+    then computes haversine on the remaining ~1% subset.
+    """
+    if not candidates:
+        raise ValueError("candidates list is empty")
+    frac = math.sqrt(0.01)
+    lat_t, lon_t = target["lat"], target["lon"]
+    indices = list(range(len(candidates)))
+
+    k_lat = max(1, math.ceil(frac * len(indices)))
+    by_lat = sorted(indices, key=lambda i: abs(candidates[i]["lat"] - lat_t))[:k_lat]
+
+    k_lon = max(1, math.ceil(frac * len(by_lat)))
+    by_lon = sorted(by_lat, key=lambda i: abs(candidates[i]["lon"] - lon_t))[:k_lon]
+
+    best_i, best_d = -1, float("inf")
+    for i in by_lon:
+        d = haversine_km(lat_t, lon_t, candidates[i]["lat"], candidates[i]["lon"])
+        if d < best_d:
+            best_d, best_i = d, i
+    return best_i
+
+
 def reconnect_components(
     nodes: Sequence[dict],
     components: list[list[int]],

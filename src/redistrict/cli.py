@@ -114,26 +114,32 @@ def run(
             return
         print(f"  {len(nodes):,} nodes loaded.")
 
-        if n_districts >= len(nodes):
+        active_nodes = [n for n in nodes if n["pop"] > 0]
+        zero_pop_nodes = [n for n in nodes if n["pop"] == 0]
+        if zero_pop_nodes:
+            print(f"  {len(zero_pop_nodes):,} zero-pop nodes excluded from graph "
+                  f"(will be assigned post-METIS).")
+
+        if n_districts >= len(active_nodes):
             print(f"Error: n_districts ({n_districts}) must be less than "
-                  f"node count ({len(nodes)}).")
+                  f"active node count ({len(active_nodes)}).")
             return
 
         adjacent_pairs = _ensure_adjacency(conn, geography, nodes)
         print(f"  {len(adjacent_pairs):,} adjacency pairs loaded.")
 
         print("\nBuilding spherical Delaunay triangulation...")
-        triangles = graph.spherical_delaunay_triangles(nodes)
+        triangles = graph.spherical_delaunay_triangles(active_nodes)
         print(f"  {len(triangles):,} triangles.")
 
         print("Deriving Urquhart graph...")
-        edges = graph.urquhart_edges(nodes, triangles)
+        edges = graph.urquhart_edges(active_nodes, triangles)
         print(f"  {len(edges):,} edges.")
 
         n_water = sum(
             1 for i, j in edges
-            if (min(nodes[i]["geoid"], nodes[j]["geoid"]),
-                max(nodes[i]["geoid"], nodes[j]["geoid"])) not in adjacent_pairs
+            if (min(active_nodes[i]["geoid"], active_nodes[j]["geoid"]),
+                max(active_nodes[i]["geoid"], active_nodes[j]["geoid"])) not in adjacent_pairs
         )
         print(f"  {n_water:,} non-adjacent (water) edges.")
 
@@ -145,7 +151,8 @@ def run(
             "recursive":        recursive,
             "ncuts":            ncuts,
             "niter":            niter,
-            "n_nodes":          len(nodes),
+            "n_nodes":          len(active_nodes),
+            "n_zero_pop_nodes": len(zero_pop_nodes),
             "n_edges":          len(edges),
             "n_water_edges":    n_water,
             "n_triangles":      len(triangles),
@@ -153,7 +160,7 @@ def run(
 
         print("\nSaving edges to database...")
         run_id = db.write_run(conn, geography, statefp, n_districts, params)
-        db.write_edges(conn, run_id, nodes, edges, adjacent_pairs)
+        db.write_edges(conn, run_id, active_nodes, edges, adjacent_pairs)
 
         state_name = _FIPS_TO_NAME.get(statefp, statefp)
         label = _GEOGRAPHY_LABELS.get(geography, geography)
@@ -201,7 +208,12 @@ def continue_run(parent_run_id: int) -> int:
               f"({n_removed} removed by user).")
 
         nodes = db.fetch_nodes(conn, geography, statefp)
-        geoid_to_idx = {n["geoid"]: i for i, n in enumerate(nodes)}
+        active_nodes = [n for n in nodes if n["pop"] > 0]
+        zero_pop_nodes = [n for n in nodes if n["pop"] == 0]
+        if zero_pop_nodes:
+            print(f"  {len(zero_pop_nodes):,} zero-pop nodes will be assigned post-METIS.")
+
+        geoid_to_idx = {n["geoid"]: i for i, n in enumerate(active_nodes)}
 
         # Rebuild index-pair edge set from geoid pairs.
         all_geoid_pairs = adj_geoid_pairs | non_adj_geoid_pairs
@@ -212,18 +224,18 @@ def continue_run(parent_run_id: int) -> int:
                 edges.add((min(i, j), max(i, j)))
 
         # Connectivity check — auto-bridge any disconnected components.
-        components = graph.check_connectivity(nodes, edges)
+        components = graph.check_connectivity(active_nodes, edges)
         if len(components) > 1:
             sizes = sorted((len(c) for c in components), reverse=True)
             print(f"\n  Graph has {len(components)} disconnected components "
                   f"(sizes: {sizes}). Auto-connecting...")
-            bridges = graph.reconnect_components(nodes, components)
+            bridges = graph.reconnect_components(active_nodes, components)
             for i, j in bridges:
-                ga = min(nodes[i]["geoid"], nodes[j]["geoid"])
-                gb = max(nodes[i]["geoid"], nodes[j]["geoid"])
+                ga = min(active_nodes[i]["geoid"], active_nodes[j]["geoid"])
+                gb = max(active_nodes[i]["geoid"], active_nodes[j]["geoid"])
                 d = graph.haversine_km(
-                    nodes[i]["lat"], nodes[i]["lon"],
-                    nodes[j]["lat"], nodes[j]["lon"],
+                    active_nodes[i]["lat"], active_nodes[i]["lon"],
+                    active_nodes[j]["lat"], active_nodes[j]["lon"],
                 )
                 print(f"    Bridge: {ga} — {gb}  ({d:.1f} km, non-adjacent)")
                 non_adj_geoid_pairs.add((ga, gb))
@@ -237,11 +249,11 @@ def continue_run(parent_run_id: int) -> int:
 
         print("Building METIS graph...")
         adj_lists, eweights, nweights = graph.build_metis_graph(
-            nodes, edges, adj_geoid_pairs,
+            active_nodes, edges, adj_geoid_pairs,
             water_penalty=water_penalty, formula=formula,
         )
 
-        print(f"\nRunning PyMETIS: {len(nodes)} nodes -> {n_districts} districts "
+        print(f"\nRunning PyMETIS: {len(active_nodes)} nodes -> {n_districts} districts "
               f"(ncuts={ncuts}, niter={niter}, recursive={recursive})...")
         edge_cut, membership = partition.partition(
             adj_lists, eweights, nweights, n_districts,
@@ -249,11 +261,20 @@ def continue_run(parent_run_id: int) -> int:
         )
         print(f"  Edge cut weight: {edge_cut:,}")
 
-        geoid_to_district = {nodes[i]["geoid"]: membership[i] for i in range(len(nodes))}
+        geoid_to_district = {active_nodes[i]["geoid"]: membership[i]
+                             for i in range(len(active_nodes))}
+
+        # Post-assign zero-pop nodes to the district of their nearest active node.
+        if zero_pop_nodes:
+            print(f"  Assigning {len(zero_pop_nodes):,} zero-pop nodes to nearest district...")
+            for zn in zero_pop_nodes:
+                nearest_idx = graph.nearest_node(zn, active_nodes)
+                nearest_geoid = active_nodes[nearest_idx]["geoid"]
+                geoid_to_district[zn["geoid"]] = geoid_to_district[nearest_geoid]
 
         pop_per_district: dict[int, int] = {}
         for i, d in enumerate(membership):
-            pop_per_district[d] = pop_per_district.get(d, 0) + nodes[i]["pop"]
+            pop_per_district[d] = pop_per_district.get(d, 0) + active_nodes[i]["pop"]
         total_pop = sum(nweights)
         ideal = total_pop / n_districts
         print("\nDistrict populations:")
@@ -274,7 +295,7 @@ def continue_run(parent_run_id: int) -> int:
         run_id = db.write_run(conn, geography, statefp, n_districts, params)
         db.write_assignments(conn, run_id, geoid_to_district)
         db.write_district_geoms(conn, run_id, geography, geoid_to_district)
-        db.write_edges(conn, run_id, nodes, edges, adj_geoid_pairs)
+        db.write_edges(conn, run_id, active_nodes, edges, adj_geoid_pairs)
         db.update_run_params(conn, parent_run_id, {"continued_as": run_id})
         print(f"  Run ID: {run_id}  (parent: {parent_run_id})")
 

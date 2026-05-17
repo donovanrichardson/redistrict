@@ -12,6 +12,7 @@ from redistrict.graph import (
     build_metis_graph,
     check_connectivity,
     haversine_km,
+    nearest_node,
     reconnect_components,
     spherical_delaunay_triangles,
     urquhart_edges,
@@ -325,3 +326,41 @@ class TestReconnectComponents:
         all_edges |= {(0, 1), (3, 4)}
         final_components = check_connectivity(nodes, all_edges)
         assert len(final_components) == 1
+
+
+# ---------------------------------------------------------------------------
+# nearest_node
+# ---------------------------------------------------------------------------
+
+class TestNearestNode:
+    def _candidates(self):
+        return [
+            {"geoid": "A", "pop": 100, "lat": 41.70, "lon": -71.55},
+            {"geoid": "B", "pop": 100, "lat": 41.72, "lon": -71.48},
+            {"geoid": "C", "pop": 100, "lat": 41.76, "lon": -71.45},
+            {"geoid": "D", "pop": 100, "lat": 41.80, "lon": -71.50},
+            {"geoid": "E", "pop": 100, "lat": 41.83, "lon": -71.57},
+        ]
+
+    def test_returns_valid_index(self):
+        candidates = self._candidates()
+        target = {"lat": 41.71, "lon": -71.53, "geoid": "Z", "pop": 0}
+        idx = nearest_node(target, candidates)
+        assert 0 <= idx < len(candidates)
+
+    def test_returns_closest(self):
+        candidates = self._candidates()
+        # Target is very close to node C
+        target = {"lat": 41.761, "lon": -71.451, "geoid": "Z", "pop": 0}
+        idx = nearest_node(target, candidates)
+        assert idx == 2  # node C
+
+    def test_single_candidate_returns_zero(self):
+        candidates = [{"geoid": "A", "pop": 100, "lat": 41.70, "lon": -71.55}]
+        target = {"lat": 42.0, "lon": -72.0, "geoid": "Z", "pop": 0}
+        assert nearest_node(target, candidates) == 0
+
+    def test_empty_candidates_raises(self):
+        target = {"lat": 41.70, "lon": -71.55, "geoid": "Z", "pop": 0}
+        with pytest.raises(ValueError):
+            nearest_node(target, [])

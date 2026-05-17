@@ -92,3 +92,30 @@ class TestRunPendingBehaviour:
             result = cli.run("44", "tracts", 2)
 
         assert result == 99
+
+    def test_run_excludes_zero_pop_nodes_from_graph(self):
+        """Zero-pop nodes must not appear in the edge set saved to DB."""
+        nodes = _make_nodes(6)
+        nodes[0]["pop"] = 0  # make first node zero-pop
+        mock_db = self._patch_db(nodes)
+
+        with patch("redistrict.cli.db", mock_db):
+            cli.run("44", "tracts", 2)
+
+        # write_edges receives active_nodes — zero-pop geoid "0" must not appear
+        call_args = mock_db.write_edges.call_args
+        active_nodes_arg = call_args[0][2]  # positional: conn, run_id, nodes, edges, adj_pairs
+        geoids = {n["geoid"] for n in active_nodes_arg}
+        assert "0" not in geoids
+
+    def test_run_records_zero_pop_count_in_params(self):
+        nodes = _make_nodes(6)
+        nodes[0]["pop"] = 0
+        nodes[1]["pop"] = 0
+        mock_db = self._patch_db(nodes)
+
+        with patch("redistrict.cli.db", mock_db):
+            cli.run("44", "tracts", 2)
+
+        params = mock_db.write_run.call_args[0][4]
+        assert params["n_zero_pop_nodes"] == 2
