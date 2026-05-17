@@ -11,6 +11,16 @@
 | 28 | `original_clamped` | Original + constant C so w_max/w_min = 4 | −2.5% (district 10) | Best population balance |
 | 29 | `blend` | 50% norm(1/cost_orig) + 50% norm(1/dist) | −3.6% (district 25) | Middle ground |
 
+## QGIS-Curated Result: run 43 (**preferred**)
+
+| Run ID | Geography | Formula | water_penalty | Curated edges | Worst Deviation | Notes |
+|--------|-----------|---------|--------------|---------------|-----------------|-------|
+| 43 | block_groups | `uniform` | 40.0 (8×) | 62 water links removed (of 1,107) | −0.8% | Best result — uniform weights, QGIS-curated water links, zero-pop nodes excluded |
+
+Parent run 41 (pending stub, block_groups, 15,739 active nodes, 331 zero-pop excluded).
+Continued via: `redistrict --continue 41 --formula uniform --water-penalty 40.0`
+GeoJSON: `run_43_curated_uniform_water8x.geojson`
+
 ## Selected Formula: `uniform` (run 27)
 
 Run 27 produced the most geographically compact districts with the least unnecessary fragmentation of dense urban areas. The absence of a population signal in edge weights means METIS cuts purely on graph topology — preferring geographic boundaries rather than demographic ones.

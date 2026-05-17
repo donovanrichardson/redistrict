@@ -293,6 +293,10 @@ def continue_run(
         params = {
             **params_orig,
             "parent_run_id":        parent_run_id,
+            "formula":              formula,
+            "water_penalty":        water_penalty,
+            "ncuts":                ncuts,
+            "niter":                niter,
             "non_adj_edges_kept":   len(non_adj_geoid_pairs),
             "non_adj_edges_removed": n_removed,
             "edge_cut":             edge_cut,
