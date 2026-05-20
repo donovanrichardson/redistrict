@@ -50,11 +50,11 @@ def compute_threshold(blocks: Sequence[dict], pct: float = THRESHOLD_PCT) -> int
     Sort blocks descending by pop, accumulate until sum >= pct * total.
     The population of the last block included is returned as the threshold.
     """
-    total = sum(b["pop"] for b in blocks)
+    total = sum(int(b["pop"]) for b in blocks)
     if total == 0:
         return 1
     target = pct * total
-    sorted_pops = sorted((b["pop"] for b in blocks if b["pop"] > 0), reverse=True)
+    sorted_pops = sorted((int(b["pop"]) for b in blocks if b["pop"] > 0), reverse=True)
     accumulated = 0
     for pop in sorted_pops:
         accumulated += pop
@@ -106,7 +106,7 @@ def aggregate_h3_cells(
 
     # cell -> total pop (sum of blocks inside)
     cell_pop: dict[str, int] = {
-        cell: sum(block_pops.get(g, 0) for g in geoids)
+        cell: sum(int(block_pops.get(g, 0)) for g in geoids)
         for cell, geoids in current.items()
     }
 
@@ -156,14 +156,14 @@ def weighted_centroids(
 
     nodes: list[dict] = []
     for cell, geoids in cell_to_geoids.items():
-        total_pop = sum(blocks_by_geoid[g]["pop"] for g in geoids)
+        total_pop = sum(int(blocks_by_geoid[g]["pop"]) for g in geoids)
         if total_pop > 0:
             lat = (
-                sum(blocks_by_geoid[g]["pop"] * float(blocks_by_geoid[g]["lat"])
+                sum(int(blocks_by_geoid[g]["pop"]) * float(blocks_by_geoid[g]["lat"])
                     for g in geoids) / total_pop
             )
             lon = (
-                sum(blocks_by_geoid[g]["pop"] * float(blocks_by_geoid[g]["lon"])
+                sum(int(blocks_by_geoid[g]["pop"]) * float(blocks_by_geoid[g]["lon"])
                     for g in geoids) / total_pop
             )
         else:

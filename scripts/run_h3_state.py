@@ -69,12 +69,12 @@ def main(statefp: str, n_districts: int) -> int:
             return
         print(f"  {len(blocks):,} blocks loaded.")
 
-        total_pop = sum(b["pop"] for b in blocks)
+        total_pop = sum(int(b["pop"]) for b in blocks)
         print(f"  Total population: {total_pop:,}")
 
         # --- Threshold ---
         threshold = h3_graph.compute_threshold(blocks)
-        above = sum(1 for b in blocks if b["pop"] > threshold)
+        above = sum(1 for b in blocks if int(b["pop"]) > threshold)
         print(f"\nThreshold (99th pct by pop mass): {threshold:,}")
         print(f"  {above:,} blocks individually above threshold (stay at res-15).")
 
@@ -85,7 +85,7 @@ def main(statefp: str, n_districts: int) -> int:
 
         # --- Bottom-up aggregation ---
         print("Aggregating H3 cells bottom-up...")
-        block_pops = {b["geoid"]: b["pop"] for b in blocks}
+        block_pops = {b["geoid"]: int(b["pop"]) for b in blocks}
         geoid_to_cell = h3_graph.aggregate_h3_cells(
             geoid_to_res15, block_pops, threshold,
         )
@@ -132,7 +132,7 @@ def main(statefp: str, n_districts: int) -> int:
         pop_per_district: dict[int, int] = {}
         for b in blocks:
             d = geoid_to_district[b["geoid"]]
-            pop_per_district[d] = pop_per_district.get(d, 0) + b["pop"]
+            pop_per_district[d] = pop_per_district.get(d, 0) + int(b["pop"])
         ideal = total_pop / n_districts
         print("\nDistrict populations:")
         for d in sorted(pop_per_district):
