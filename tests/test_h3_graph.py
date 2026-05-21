@@ -27,23 +27,23 @@ def _block(geoid: str, pop: int, lat: float = 41.7, lon: float = -71.5) -> dict:
 
 class TestComputeThreshold:
     def test_example_from_spec(self):
-        # 1 block pop=100, 1500 blocks each pop≈6.6, total≈10000
-        # 1% = 100; first block hits target → threshold = 100
+        # 1 block pop=100, 1500 blocks each pop≈6, total≈9100
+        # 1% target ≈ 91; first block (pop=100) hits target → threshold=100
         blocks = [_block("A", 100)] + [_block(str(i), 6) for i in range(1500)]
         assert compute_threshold(blocks) == 100
 
     def test_returns_block_population_not_cumulative(self):
-        # 3 blocks: 500, 300, 200 → total=1000, 1%=10
-        # First block (pop=500) immediately exceeds target → threshold=500
-        blocks = [_block("A", 500), _block("B", 300), _block("C", 200)]
+        # 3 blocks: 5000, 3000, 2000 → total=10000, 1%=100
+        # First block (pop=5000) immediately exceeds target → threshold=5000
+        blocks = [_block("A", 5000), _block("B", 3000), _block("C", 2000)]
         result = compute_threshold(blocks)
-        assert result == 500
+        assert result == 5000
 
     def test_multiple_blocks_needed(self):
-        # 10 blocks each pop=10 → total=100, 1%=1
-        # First block (pop=10) hits target → threshold=10
-        blocks = [_block(str(i), 10) for i in range(10)]
-        assert compute_threshold(blocks) == 10
+        # 200 blocks each pop=50 → total=10000, 1%=100
+        # Need 2 blocks to accumulate 100 → threshold=50
+        blocks = [_block(str(i), 50) for i in range(200)]
+        assert compute_threshold(blocks) == 50
 
     def test_zero_pop_blocks_ignored(self):
         # Zero-pop blocks don't contribute; threshold comes from positive ones
@@ -233,33 +233,28 @@ class TestWeightedCentroids:
 # ---------------------------------------------------------------------------
 
 class TestBuildH3Adjacency:
-    def test_adjacent_res15_cells_are_adjacent(self):
-        base = h3.latlng_to_cell(41.70, -71.55, 15)
-        # get a true H3 neighbour of base
-        neighbours = list(set(h3.grid_disk(base, 1)) - {base})
-        neighbour = neighbours[0]
+    def test_adjacent_cells_are_adjacent(self):
+        # Use a coarser resolution so neighbours are more meaningful
+        base = h3.latlng_to_cell(41.70, -71.55, 8)
+        neighbour = list(set(h3.grid_disk(base, 1)) - {base})[0]
 
         geoid_to_cell = {"A": base, "B": neighbour}
-        geoid_to_res15 = {"A": base, "B": neighbour}
-
-        edges = build_h3_adjacency(geoid_to_cell, geoid_to_res15)
+        edges = build_h3_adjacency(geoid_to_cell)
         expected = (min(base, neighbour), max(base, neighbour))
         assert expected in edges
 
     def test_non_adjacent_cells_not_connected(self):
-        cell_a = h3.latlng_to_cell(41.70, -71.55, 15)
-        cell_b = h3.latlng_to_cell(42.50, -73.00, 15)  # far away
+        cell_a = h3.latlng_to_cell(41.70, -71.55, 8)
+        cell_b = h3.latlng_to_cell(42.50, -73.00, 8)  # far away
         geoid_to_cell = {"A": cell_a, "B": cell_b}
-        geoid_to_res15 = {"A": cell_a, "B": cell_b}
-        edges = build_h3_adjacency(geoid_to_cell, geoid_to_res15)
+        edges = build_h3_adjacency(geoid_to_cell)
         expected = (min(cell_a, cell_b), max(cell_a, cell_b))
         assert expected not in edges
 
     def test_same_cell_no_self_loop(self):
-        cell = h3.latlng_to_cell(41.70, -71.55, 15)
+        cell = h3.latlng_to_cell(41.70, -71.55, 8)
         geoid_to_cell = {"A": cell, "B": cell}
-        geoid_to_res15 = {"A": cell, "B": cell}
-        edges = build_h3_adjacency(geoid_to_cell, geoid_to_res15)
+        edges = build_h3_adjacency(geoid_to_cell)
         for a, b in edges:
             assert a != b
 

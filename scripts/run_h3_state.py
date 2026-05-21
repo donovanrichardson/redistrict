@@ -69,28 +69,32 @@ def main(statefp: str, n_districts: int) -> int:
             return
         print(f"  {len(blocks):,} blocks loaded.")
 
-        total_pop = sum(int(b["pop"]) for b in blocks)
+        active_blocks = [b for b in blocks if int(b["pop"]) > 0]
+        zero_pop_blocks = [b for b in blocks if int(b["pop"]) == 0]
+        total_pop = sum(int(b["pop"]) for b in active_blocks)
+        print(f"  {len(active_blocks):,} active blocks, "
+              f"{len(zero_pop_blocks):,} zero-pop (post-assigned after METIS).")
         print(f"  Total population: {total_pop:,}")
 
         # --- Threshold ---
-        threshold = h3_graph.compute_threshold(blocks)
-        above = sum(1 for b in blocks if int(b["pop"]) > threshold)
+        threshold = h3_graph.compute_threshold(active_blocks)
+        above = sum(1 for b in active_blocks if int(b["pop"]) > threshold)
         print(f"\nThreshold (99th pct by pop mass): {threshold:,}")
         print(f"  {above:,} blocks individually above threshold (stay at res-15).")
 
-        # --- H3 res-15 assignment ---
+        # --- H3 res-15 assignment (active only) ---
         print("\nAssigning blocks to H3 resolution-15...")
-        geoid_to_res15 = h3_graph.assign_h3_res15(blocks)
+        geoid_to_res15 = h3_graph.assign_h3_res15(active_blocks)
         print(f"  {len(set(geoid_to_res15.values())):,} unique res-15 cells.")
 
         # --- Bottom-up aggregation ---
         print("Aggregating H3 cells bottom-up...")
-        block_pops = {b["geoid"]: int(b["pop"]) for b in blocks}
+        block_pops = {b["geoid"]: int(b["pop"]) for b in active_blocks}
         geoid_to_cell = h3_graph.aggregate_h3_cells(
             geoid_to_res15, block_pops, threshold,
         )
         n_cells = len(set(geoid_to_cell.values()))
-        print(f"  {n_cells:,} aggregated cells (from {len(blocks):,} blocks).")
+        print(f"  {n_cells:,} aggregated cells (from {len(active_blocks):,} active blocks).")
 
         if n_districts >= n_cells:
             print(f"Error: n_districts ({n_districts}) >= cell count ({n_cells}).")
@@ -104,7 +108,7 @@ def main(statefp: str, n_districts: int) -> int:
 
         # --- Adjacency ---
         print("Building H3 adjacency graph...")
-        adjacency = h3_graph.build_h3_adjacency(geoid_to_cell, geoid_to_res15)
+        adjacency = h3_graph.build_h3_adjacency(geoid_to_cell)
         print(f"  {len(adjacency):,} edges.")
 
         # --- Connectivity check ---
@@ -128,9 +132,16 @@ def main(statefp: str, n_districts: int) -> int:
                             for i in range(len(cell_nodes))}
         geoid_to_district = {g: cell_to_district[c] for g, c in geoid_to_cell.items()}
 
+        # --- Post-assign zero-pop blocks to nearest active block's district ---
+        if zero_pop_blocks:
+            print(f"  Assigning {len(zero_pop_blocks):,} zero-pop blocks to nearest district...")
+            for zb in zero_pop_blocks:
+                nearest_idx = graph.nearest_node(zb, active_blocks)
+                geoid_to_district[zb["geoid"]] = geoid_to_district[active_blocks[nearest_idx]["geoid"]]
+
         # --- Population stats ---
         pop_per_district: dict[int, int] = {}
-        for b in blocks:
+        for b in active_blocks:
             d = geoid_to_district[b["geoid"]]
             pop_per_district[d] = pop_per_district.get(d, 0) + int(b["pop"])
         ideal = total_pop / n_districts

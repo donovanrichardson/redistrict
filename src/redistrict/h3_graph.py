@@ -99,10 +99,11 @@ def aggregate_h3_cells(
     Cells whose individual population already exceeds threshold remain at
     res 15 (they prevent their parent from being merged too).
     """
-    # Build: current_cell -> list[geoid]
+    # Build: current_cell -> list[geoid], excluding zero-pop blocks
     current: dict[str, list[str]] = {}
     for geoid, cell in geoid_to_res15.items():
-        current.setdefault(cell, []).append(geoid)
+        if int(block_pops.get(geoid, 0)) > 0:
+            current.setdefault(cell, []).append(geoid)
 
     # cell -> total pop (sum of blocks inside)
     cell_pop: dict[str, int] = {
@@ -178,33 +179,56 @@ def weighted_centroids(
 
 def build_h3_adjacency(
     geoid_to_cell: dict[str, str],
-    geoid_to_res15: dict[str, str],
+    min_res: int = DEFAULT_MIN_RES,
 ) -> set[tuple[str, str]]:
     """
     Build adjacency between final (possibly mixed-resolution) H3 cells.
 
-    Strategy: map each res-15 cell to its final aggregated ancestor, then
-    for each res-15 cell inspect its 6 H3 neighbours.  If a neighbour maps
-    to a different final cell, the two final cells are adjacent.
+    For each final cell C, H3 neighbours are fetched at C's own resolution.
+    Three cases handle mixed resolutions:
 
-    This correctly handles mixed resolutions: a coarse cell is adjacent to
-    any fine cell whose res-15 representative neighbours a res-15 descendant
-    of the coarse cell.
+      1. Neighbour N is directly in the final cell set — same-resolution edge.
+      2. N is not in the set but one of its coarser ancestors is — the blocks
+         in N were merged upward into that ancestor.
+      3. N is not in the set but it is a coarser parent of finer final cells —
+         the blocks inside N stayed at finer resolutions (dense area).
     """
-    # res-15 cell -> final cell
-    res15_to_final: dict[str, str] = {}
-    for geoid, res15 in geoid_to_res15.items():
-        res15_to_final[res15] = geoid_to_cell[geoid]
+    cell_set: set[str] = set(geoid_to_cell.values())
+
+    # ancestor_cell -> set of final cells that are its descendants (case 3)
+    parent_to_finals: dict[str, set[str]] = {}
+    for cell in cell_set:
+        res = h3.get_resolution(cell)
+        for r in range(min_res, res):
+            anc = h3.cell_to_parent(cell, r)
+            parent_to_finals.setdefault(anc, set()).add(cell)
 
     edges: set[tuple[str, str]] = set()
-    for res15_cell, final_cell in res15_to_final.items():
-        for neighbour in set(h3.grid_disk(res15_cell, 1)):
-            if neighbour == res15_cell:
+
+    def _add(a: str, b: str) -> None:
+        if a != b:
+            edges.add((min(a, b), max(a, b)))
+
+    for final_cell in cell_set:
+        for neighbour in set(h3.grid_disk(final_cell, 1)) - {final_cell}:
+            # Case 1: direct neighbour at same resolution
+            if neighbour in cell_set:
+                _add(final_cell, neighbour)
                 continue
-            neighbour_final = res15_to_final.get(neighbour)
-            if neighbour_final and neighbour_final != final_cell:
-                a, b = min(final_cell, neighbour_final), max(final_cell, neighbour_final)
-                edges.add((a, b))
+
+            # Case 2: neighbour was merged into a coarser ancestor
+            n_res = h3.get_resolution(neighbour)
+            for r in range(n_res - 1, min_res - 1, -1):
+                anc = h3.cell_to_parent(neighbour, r)
+                if anc in cell_set:
+                    _add(final_cell, anc)
+                    break
+
+            # Case 3: neighbour is a coarser placeholder containing finer finals
+            if neighbour in parent_to_finals:
+                for desc in parent_to_finals[neighbour]:
+                    _add(final_cell, desc)
+
     return edges
 
 
