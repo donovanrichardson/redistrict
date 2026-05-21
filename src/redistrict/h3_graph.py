@@ -220,9 +220,20 @@ def compute_leaves_and_provisional_edges(
                 for child in effective_children:
                     _mark_leaf(child)
 
-    for P in populated_at_res.get(0, set()):
-        if P not in has_leaf_descendant and P not in leaves:
-            _mark_leaf(P)
+    # Coarse-to-fine boundary pass: mark the coarsest uncovered cell in each orphaned
+    # branch — cells whose parent has leaf descendants (from another sub-branch) but
+    # they themselves have none.  Goes coarse-to-fine so we get one leaf per gap, not one
+    # per intermediate level.
+    for res in range(0, 15):
+        for P in populated_at_res.get(res, set()):
+            if P in has_leaf_descendant or P in leaves:
+                continue
+            if res == 0:
+                _mark_leaf(P)
+            else:
+                parent = h3.cell_to_parent(P, res - 1)
+                if parent in has_leaf_descendant:
+                    _mark_leaf(P)
 
     return leaves, provisional_edges
 
@@ -602,6 +613,67 @@ def show_leaves(
 
     ax.set_title(f"{title}\n{len(leaves):,} leaf cells  "
                  f"(res {min_res}–{max_res})", fontsize=12)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_aspect("equal")
+    plt.tight_layout()
+    plt.show()
+
+
+def show_partition(
+    cell_nodes: list[dict],
+    cell_to_district: dict[str, int],
+    title: str = "H3 Partition",
+) -> None:
+    """
+    Open a matplotlib window showing every leaf cell coloured by district assignment.
+    Zero-pop bridge nodes are drawn with a hatched pattern at reduced opacity.
+    """
+    import geopandas as gpd
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import matplotlib.patches as mpatches
+
+    n_districts = len(set(cell_to_district.values()))
+    cmap = plt.cm.get_cmap("tab20" if n_districts > 10 else "tab10")
+    district_colour = {d: mcolors.to_hex(cmap(i / max(n_districts - 1, 1)))
+                       for i, d in enumerate(sorted(set(cell_to_district.values())))}
+
+    rows = []
+    for node in cell_nodes:
+        cell = node["cell"]
+        dist = cell_to_district.get(cell)
+        if dist is None:
+            continue
+        boundary = h3.cell_to_boundary(cell)
+        coords = [(lon, lat) for lat, lon in boundary]
+        rows.append({
+            "geometry": Polygon(coords),
+            "district": dist,
+            "colour": district_colour[dist],
+            "zero_pop": node["pop"] == 0,
+        })
+
+    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    pop_gdf = gdf[~gdf["zero_pop"]]
+    zp_gdf = gdf[gdf["zero_pop"]]
+
+    if not pop_gdf.empty:
+        pop_gdf.plot(ax=ax, color=pop_gdf["colour"], edgecolor="white",
+                     linewidth=0.3, alpha=0.85)
+    if not zp_gdf.empty:
+        zp_gdf.plot(ax=ax, color=zp_gdf["colour"], edgecolor="white",
+                    linewidth=0.2, alpha=0.35)
+
+    legend_elements = [
+        mpatches.Patch(facecolor=district_colour[d], edgecolor="grey",
+                       label=f"District {d}")
+        for d in sorted(district_colour)
+    ]
+    ax.legend(handles=legend_elements, loc="lower left", fontsize=9, title="District")
+    ax.set_title(title, fontsize=12)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_aspect("equal")

@@ -496,7 +496,7 @@ def write_district_geoms_wkt(
                 """
                 INSERT INTO public.redistrict_districts (run_id, district_id, geom, pop20)
                 VALUES (%s, %s,
-                    ST_Multi(ST_GeomFromText(%s, 4326))::geometry(MultiPolygon, 4269),
+                    ST_Multi(ST_Transform(ST_GeomFromText(%s, 4326), 4269)),
                     %s)
                 """,
                 (run_id, dist_id, wkt, pop),

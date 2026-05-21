@@ -438,7 +438,7 @@ class TestComputeLeavesAndProvisionalEdges:
         leaves, _ = compute_leaves_and_provisional_edges(
             cell_pop, cell_direct_children, populated_at_res, threshold=1
         )
-        # Only one child at every level → percolates to res-0 leaf
+        # Only one child at every level → no splits, cleanup marks the res-0 ancestor
         assert len(leaves) == 1
         leaf = next(iter(leaves))
         assert h3.get_resolution(leaf) == 0
@@ -451,12 +451,35 @@ class TestComputeLeavesAndProvisionalEdges:
         cell_pop, cell_direct_children, populated_at_res = build_cell_hierarchy(
             geoid_to_res15, block_pops
         )
-        # threshold >> total pop → never splits → all collapse to single res-0 leaf
+        # threshold >> total pop → never splits → collapses to single res-0 leaf
         leaves, _ = compute_leaves_and_provisional_edges(
             cell_pop, cell_direct_children, populated_at_res, threshold=10_000
         )
         assert len(leaves) == 1
         assert h3.get_resolution(next(iter(leaves))) == 0
+
+    def test_orphaned_branch_gets_coarsest_leaf(self):
+        # res-13 parent P13 has two res-14 children: A14 (dense, splits) and B14 (sparse).
+        # A14's blocks create fine leaves → P13 enters has_leaf_descendant.
+        # B14 has no leaf descendants → would be orphaned by old res-0-only cleanup.
+        # New boundary pass should mark B14 (or its res-13 ancestor) as a leaf.
+        p13 = h3.latlng_to_cell(41.70, -71.55, 13)
+        children14 = sorted(h3.cell_to_children(p13, 14))
+        a14, b14 = children14[0], children14[-1]
+        # Dense cluster under a14: 3 res-15 children with high pop
+        a15s = list(h3.cell_to_children(a14, 15))[:3]
+        # Sparse cluster under b14: 2 res-15 children with very low pop
+        b15s = list(h3.cell_to_children(b14, 15))[:2]
+        geoid_to_res15 = {str(i): c for i, c in enumerate(a15s + b15s)}
+        block_pops = {str(i): 5000 for i in range(len(a15s))}  # dense
+        block_pops.update({str(len(a15s) + i): 1 for i in range(len(b15s))})  # sparse
+        cell_pop, cdc, par = build_cell_hierarchy(geoid_to_res15, block_pops)
+        # threshold=100 → a14 (pop≈15000) splits; b14 (pop=2) doesn't
+        leaves, _ = compute_leaves_and_provisional_edges(cell_pop, cdc, par, threshold=100)
+        # All b15s blocks must have a leaf ancestor
+        assigned = assign_geoids_to_leaves(geoid_to_res15, leaves)
+        for i in range(len(a15s), len(a15s) + len(b15s)):
+            assert str(i) in assigned, f"Block {i} (sparse branch) has no leaf"
 
     def test_provisional_edges_added_between_neighboring_leaves(self):
         # Build two adjacent res-14 groups (each with 2 res-15 children).

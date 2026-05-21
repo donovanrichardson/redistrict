@@ -166,13 +166,30 @@ def main(statefp: str, n_districts: int) -> int:
         # --- Disaggregate: cell -> district, then block -> district ---
         cell_to_district = {cell_nodes[i]["cell"]: membership[i]
                             for i in range(len(cell_nodes))}
+
+        # --- Partition visualisation ---
+        h3_graph.show_partition(
+            cell_nodes, cell_to_district,
+            title=f"{state_name} — {n_districts} districts (edge cut {edge_cut:,})",
+        )
         geoid_to_district = {g: cell_to_district[c] for g, c in geoid_to_cell.items()}
 
-        # --- Post-assign zero-pop blocks to nearest active block's district ---
+        # --- Post-assign zero-pop census blocks via H3 ancestor, haversine fallback ---
+        assigned_blocks = [b for b in active_blocks if b["geoid"] in geoid_to_district]
         if zero_pop_blocks:
             for zb in tqdm(zero_pop_blocks, desc="Assigning zero-pop blocks", unit="block"):
-                nearest_idx = graph.nearest_node(zb, active_blocks)
-                geoid_to_district[zb["geoid"]] = geoid_to_district[active_blocks[nearest_idx]["geoid"]]
+                res15 = h3.latlng_to_cell(float(zb["lat"]), float(zb["lon"]), 15)
+                district = cell_to_district.get(res15)
+                if district is None:
+                    for r in range(14, -1, -1):
+                        anc = h3.cell_to_parent(res15, r)
+                        if anc in cell_to_district:
+                            district = cell_to_district[anc]
+                            break
+                if district is None:
+                    nearest_idx = graph.nearest_node(zb, assigned_blocks)
+                    district = geoid_to_district[assigned_blocks[nearest_idx]["geoid"]]
+                geoid_to_district[zb["geoid"]] = district
 
         # --- Population stats ---
         pop_per_district: dict[int, int] = {}
@@ -202,16 +219,11 @@ def main(statefp: str, n_districts: int) -> int:
             "niter":               NITER,
             "recursive":           RECURSIVE,
         }
-        # --- District geometries (populated cells only, no zero-pop bridges) ---
-        print("\nBuilding district geometries from H3 cells...")
-        pop_cell_to_district = {c: d for c, d in cell_to_district.items()
-                                 if c in pop_leaves}
-        district_geoms = h3_graph.build_district_geoms(pop_cell_to_district, pop_per_district)
-
         print("Writing results to database...")
         run_id = db.write_run(conn, "blocks", statefp, n_districts, params)
         db.write_assignments(conn, run_id, geoid_to_district)
-        db.write_district_geoms_wkt(conn, run_id, district_geoms)
+        print("\nBuilding district geometries from census block shapes...")
+        db.write_district_geoms(conn, run_id, "blocks", geoid_to_district)
         print(f"  Run ID: {run_id}")
 
         # --- GeoJSON export ---

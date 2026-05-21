@@ -55,7 +55,7 @@ def partition(
         )
 
     # contig only works with k-way. Recursive bisection ignores it.
-    contig = 0 if recursive else 1
+    contig = 0 if recursive else True
     options = pymetis.Options(ncuts=ncuts, niter=niter, contig=contig, ufactor=8, seed=42)
 
     result = pymetis.part_graph(
