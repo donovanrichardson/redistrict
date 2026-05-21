@@ -5,11 +5,17 @@ import pytest
 
 from redistrict.h3_graph import (
     aggregate_h3_cells,
+    assign_geoids_to_leaves,
     assign_h3_res15,
+    build_cell_hierarchy,
     build_h3_adjacency,
     build_metis_graph,
     check_connectivity,
+    compute_leaves_and_provisional_edges,
     compute_threshold,
+    compute_top_level,
+    find_zero_pop_leaves,
+    resolve_edges,
     weighted_centroids,
 )
 
@@ -336,3 +342,320 @@ class TestCheckConnectivity:
     def test_empty_edges_all_isolated(self):
         nodes = self._cells(3)
         assert len(check_connectivity(nodes, set())) == 3
+
+
+# ---------------------------------------------------------------------------
+# build_cell_hierarchy
+# ---------------------------------------------------------------------------
+
+class TestBuildCellHierarchy:
+    def _res15_siblings(self):
+        """Return three res-15 cells sharing the same res-14 parent."""
+        base = h3.latlng_to_cell(41.70, -71.55, 15)
+        parent14 = h3.cell_to_parent(base, 14)
+        children = list(h3.cell_to_children(parent14, 15))[:3]
+        return parent14, children
+
+    def test_cell_pop_sums_blocks(self):
+        parent14, children = self._res15_siblings()
+        geoid_to_res15 = {str(i): c for i, c in enumerate(children)}
+        block_pops = {str(i): (i + 1) * 10 for i in range(len(children))}
+        cell_pop, _, _ = build_cell_hierarchy(geoid_to_res15, block_pops)
+        for i, c in enumerate(children):
+            assert cell_pop[c] == (i + 1) * 10
+        assert cell_pop[parent14] == sum((i + 1) * 10 for i in range(len(children)))
+
+    def test_zero_pop_blocks_excluded(self):
+        parent14, children = self._res15_siblings()
+        geoid_to_res15 = {"A": children[0], "B": children[1]}
+        block_pops = {"A": 0, "B": 50}
+        cell_pop, _, populated_at_res = build_cell_hierarchy(geoid_to_res15, block_pops)
+        assert children[0] not in cell_pop
+        assert children[1] in cell_pop
+        assert children[0] not in populated_at_res[15]
+
+    def test_cell_direct_children(self):
+        parent14, children = self._res15_siblings()
+        geoid_to_res15 = {str(i): c for i, c in enumerate(children)}
+        block_pops = {str(i): 10 for i in range(len(children))}
+        _, cell_direct_children, _ = build_cell_hierarchy(geoid_to_res15, block_pops)
+        assert set(children) == cell_direct_children[parent14]
+
+    def test_populated_at_res_contains_only_populated(self):
+        _, children = self._res15_siblings()
+        geoid_to_res15 = {"A": children[0]}
+        block_pops = {"A": 100}
+        _, _, populated_at_res = build_cell_hierarchy(geoid_to_res15, block_pops)
+        assert children[0] in populated_at_res[15]
+        # res-0 should contain exactly one cell (the ancestor chain)
+        assert len(populated_at_res[0]) == 1
+
+    def test_pop_accumulates_through_all_levels(self):
+        _, children = self._res15_siblings()
+        geoid_to_res15 = {"A": children[0]}
+        block_pops = {"A": 777}
+        cell_pop, _, populated_at_res = build_cell_hierarchy(geoid_to_res15, block_pops)
+        for res in range(0, 16):
+            for cell in populated_at_res.get(res, set()):
+                assert cell_pop[cell] == 777
+
+
+# ---------------------------------------------------------------------------
+# compute_leaves_and_provisional_edges
+# ---------------------------------------------------------------------------
+
+class TestComputeLeavesAndProvisionalEdges:
+    def _hierarchy_two_siblings(self, pop_each: int = 100):
+        """Two res-15 cells sharing a res-14 parent."""
+        base = h3.latlng_to_cell(41.70, -71.55, 15)
+        parent14 = h3.cell_to_parent(base, 14)
+        children = list(h3.cell_to_children(parent14, 15))[:2]
+        geoid_to_res15 = {str(i): c for i, c in enumerate(children)}
+        block_pops = {str(i): pop_each for i in range(len(children))}
+        return build_cell_hierarchy(geoid_to_res15, block_pops)
+
+    def test_children_become_leaves_when_parent_exceeds_threshold(self):
+        parent14 = h3.cell_to_parent(h3.latlng_to_cell(41.70, -71.55, 15), 14)
+        children = list(h3.cell_to_children(parent14, 15))[:2]
+        geoid_to_res15 = {str(i): c for i, c in enumerate(children)}
+        block_pops = {str(i): 1000 for i in range(2)}
+        cell_pop, cell_direct_children, populated_at_res = build_cell_hierarchy(
+            geoid_to_res15, block_pops
+        )
+        # threshold = 1 so parent pop (2000) > threshold → children become leaves
+        leaves, _ = compute_leaves_and_provisional_edges(
+            cell_pop, cell_direct_children, populated_at_res, threshold=1
+        )
+        assert set(children).issubset(leaves)
+
+    def test_single_child_does_not_split(self):
+        cell15 = h3.latlng_to_cell(41.70, -71.55, 15)
+        geoid_to_res15 = {"A": cell15}
+        block_pops = {"A": 9999}
+        cell_pop, cell_direct_children, populated_at_res = build_cell_hierarchy(
+            geoid_to_res15, block_pops
+        )
+        leaves, _ = compute_leaves_and_provisional_edges(
+            cell_pop, cell_direct_children, populated_at_res, threshold=1
+        )
+        # Only one child at every level → percolates to res-0 leaf
+        assert len(leaves) == 1
+        leaf = next(iter(leaves))
+        assert h3.get_resolution(leaf) == 0
+
+    def test_below_threshold_collapses_to_coarse_leaf(self):
+        parent14 = h3.cell_to_parent(h3.latlng_to_cell(41.70, -71.55, 15), 14)
+        children = list(h3.cell_to_children(parent14, 15))[:3]
+        geoid_to_res15 = {str(i): c for i, c in enumerate(children)}
+        block_pops = {str(i): 1 for i in range(3)}
+        cell_pop, cell_direct_children, populated_at_res = build_cell_hierarchy(
+            geoid_to_res15, block_pops
+        )
+        # threshold >> total pop → never splits → all collapse to single res-0 leaf
+        leaves, _ = compute_leaves_and_provisional_edges(
+            cell_pop, cell_direct_children, populated_at_res, threshold=10_000
+        )
+        assert len(leaves) == 1
+        assert h3.get_resolution(next(iter(leaves))) == 0
+
+    def test_provisional_edges_added_between_neighboring_leaves(self):
+        # Build two adjacent res-14 groups (each with 2 res-15 children).
+        # threshold=1 so both parents exceed threshold → all children become leaves.
+        # Neighboring leaves should have provisional edges between them.
+        parent14 = h3.cell_to_parent(h3.latlng_to_cell(41.70, -71.55, 15), 14)
+        children14 = list(h3.cell_to_children(parent14, 15))[:2]
+        nb14 = list(set(h3.grid_disk(parent14, 1)) - {parent14})[0]
+        children_nb14 = list(h3.cell_to_children(nb14, 15))[:2]
+
+        all_cells = children14 + children_nb14
+        geoid_to_res15 = {str(i): c for i, c in enumerate(all_cells)}
+        block_pops = {str(i): 1000 for i in range(len(all_cells))}
+        cell_pop, cell_direct_children, populated_at_res = build_cell_hierarchy(
+            geoid_to_res15, block_pops
+        )
+        leaves, provisional = compute_leaves_and_provisional_edges(
+            cell_pop, cell_direct_children, populated_at_res, threshold=1
+        )
+        assert len(provisional) > 0
+
+
+# ---------------------------------------------------------------------------
+# resolve_edges
+# ---------------------------------------------------------------------------
+
+class TestResolveEdges:
+    def _two_leaf_cells(self):
+        base = h3.latlng_to_cell(41.70, -71.55, 8)
+        nb = list(set(h3.grid_disk(base, 1)) - {base})[0]
+        return base, nb
+
+    def test_confirms_edge_when_both_are_leaves(self):
+        A, N = self._two_leaf_cells()
+        leaves = {A, N}
+        provisional = {(A, N)}  # directed: A is the originating leaf
+        confirmed = resolve_edges(provisional, leaves)
+        assert (min(A, N), max(A, N)) in confirmed
+
+    def test_redirects_to_leaf_ancestor(self):
+        # N_fine is a res-15 neighbor; its res-8 ancestor N_coarse is a leaf.
+        # Edge should be redirected from (A, N_fine) to (A, N_coarse).
+        N_fine = h3.latlng_to_cell(41.70, -71.55, 15)
+        N_coarse = h3.cell_to_parent(N_fine, 8)
+        A = h3.latlng_to_cell(42.00, -72.00, 15)
+        leaves = {A, N_coarse}
+        provisional = {(A, N_fine)}  # directed: A is leaf, N_fine is the raw neighbor
+        confirmed = resolve_edges(provisional, leaves)
+        expected = (min(A, N_coarse), max(A, N_coarse))
+        assert expected in confirmed
+
+    def test_discards_when_no_leaf_ancestor(self):
+        A = h3.latlng_to_cell(41.70, -71.55, 15)
+        N = h3.latlng_to_cell(42.00, -72.00, 15)
+        leaves = {A}  # N has no leaf ancestor
+        provisional = {(A, N)}
+        confirmed = resolve_edges(provisional, leaves)
+        assert len(confirmed) == 0
+
+    def test_no_self_loops(self):
+        A = h3.latlng_to_cell(41.70, -71.55, 8)
+        leaves = {A}
+        provisional = {(A, A)}
+        confirmed = resolve_edges(provisional, leaves)
+        assert (A, A) not in confirmed
+
+
+# ---------------------------------------------------------------------------
+# assign_geoids_to_leaves
+# ---------------------------------------------------------------------------
+
+class TestAssignGeooidsToLeaves:
+    def test_direct_assignment_when_res15_is_leaf(self):
+        cell = h3.latlng_to_cell(41.70, -71.55, 15)
+        leaves = {cell}
+        result = assign_geoids_to_leaves({"A": cell}, leaves)
+        assert result["A"] == cell
+
+    def test_ancestor_lookup(self):
+        cell15 = h3.latlng_to_cell(41.70, -71.55, 15)
+        leaf = h3.cell_to_parent(cell15, 8)
+        leaves = {leaf}
+        result = assign_geoids_to_leaves({"A": cell15}, leaves)
+        assert result["A"] == leaf
+
+    def test_all_geoids_assigned(self):
+        parent14 = h3.cell_to_parent(h3.latlng_to_cell(41.70, -71.55, 15), 14)
+        cells = list(h3.cell_to_children(parent14, 15))[:4]
+        leaf = h3.cell_to_parent(cells[0], 8)
+        leaves = {leaf}
+        geoid_to_res15 = {str(i): c for i, c in enumerate(cells)}
+        result = assign_geoids_to_leaves(geoid_to_res15, leaves)
+        assert set(result.keys()) == set(geoid_to_res15.keys())
+        assert all(v == leaf for v in result.values())
+
+
+# ---------------------------------------------------------------------------
+# TestIntegratedZeroPopLeaves
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TestComputeTopLevel
+# ---------------------------------------------------------------------------
+
+class TestComputeTopLevel:
+    def test_single_leaf_returns_its_res0_ancestor(self):
+        cell = h3.latlng_to_cell(41.70, -71.55, 5)
+        result = compute_top_level({cell})
+        assert len(result) == 1
+        (tl,) = result
+        assert h3.get_resolution(tl) <= 5
+
+    def test_two_leaves_same_parent_returns_parent(self):
+        parent = h3.latlng_to_cell(41.70, -71.55, 3)
+        children = list(h3.cell_to_children(parent, 4))[:2]
+        result = compute_top_level(set(children))
+        assert result == {parent}
+
+    def test_two_leaves_different_parents_returns_common_ancestor(self):
+        parent = h3.latlng_to_cell(41.70, -71.55, 2)
+        children3 = list(h3.cell_to_children(parent, 3))[:2]
+        result = compute_top_level(set(children3))
+        (tl,) = result
+        assert h3.get_resolution(tl) <= 2
+        for L in children3:
+            assert h3.cell_to_parent(L, h3.get_resolution(tl)) == tl
+
+    def test_empty_leaves_returns_empty(self):
+        assert compute_top_level(set()) == set()
+
+    def test_leaves_at_mixed_resolutions(self):
+        parent3 = h3.latlng_to_cell(41.70, -71.55, 3)
+        child4 = list(h3.cell_to_children(parent3, 4))[0]
+        result = compute_top_level({parent3, child4})
+        assert result == {parent3}
+
+
+# ---------------------------------------------------------------------------
+# TestFindZeroPopLeaves
+# ---------------------------------------------------------------------------
+
+class TestFindZeroPopLeaves:
+    def _setup(self):
+        """
+        One res-13 parent with two populated clusters (res-14 A and C).
+        Remaining res-14 siblings of parent13 are zero-pop.
+        """
+        parent13 = h3.latlng_to_cell(41.70, -71.55, 13)
+        children14 = sorted(h3.cell_to_children(parent13, 14))
+        parent14_A = children14[0]
+        parent14_C = children14[-1]
+
+        children15_A = list(h3.cell_to_children(parent14_A, 15))[:2]
+        children15_C = list(h3.cell_to_children(parent14_C, 15))[:2]
+        all_res15 = children15_A + children15_C
+        geoid_to_res15 = {str(i): c for i, c in enumerate(all_res15)}
+        block_pops = {str(i): 1000 for i in range(len(all_res15))}
+        cell_pop, cdc, par = build_cell_hierarchy(geoid_to_res15, block_pops)
+        pop_leaves, _ = compute_leaves_and_provisional_edges(cell_pop, cdc, par, threshold=1)
+        top_level = compute_top_level(pop_leaves)
+        return parent13, parent14_A, parent14_C, pop_leaves, top_level
+
+    def test_populated_leaves_not_in_zero_pop_result(self):
+        _, _, _, pop_leaves, top_level = self._setup()
+        zero_pop = find_zero_pop_leaves(pop_leaves, top_level)
+        assert pop_leaves.isdisjoint(zero_pop)
+
+    def test_zero_pop_res14_siblings_become_leaves(self):
+        parent13, parent14_A, parent14_C, pop_leaves, top_level = self._setup()
+        zero_pop = find_zero_pop_leaves(pop_leaves, top_level)
+        all_children14 = set(h3.cell_to_children(parent13, 14))
+        expected_bridges = all_children14 - {parent14_A, parent14_C}
+        assert expected_bridges.issubset(zero_pop)
+
+    def test_all_leaves_cover_full_scope(self):
+        # Every res-14 cell under parent13 must be either a populated leaf (at res-15)
+        # or a zero-pop leaf (at res-14).
+        parent13, _, _, pop_leaves, top_level = self._setup()
+        zero_pop = find_zero_pop_leaves(pop_leaves, top_level)
+        all_leaves = pop_leaves | zero_pop
+        for cell14 in h3.cell_to_children(parent13, 14):
+            is_pop_ancestor = any(
+                h3.cell_to_parent(L, 14) == cell14
+                for L in pop_leaves
+                if h3.get_resolution(L) >= 14
+            )
+            if is_pop_ancestor:
+                pass  # children of this cell are in pop_leaves
+            else:
+                assert cell14 in all_leaves, f"{cell14} not covered"
+
+    def test_empty_top_level_returns_empty(self):
+        _, _, _, pop_leaves, _ = self._setup()
+        assert find_zero_pop_leaves(pop_leaves, set()) == set()
+
+    def test_top_level_is_populated_leaf_returns_empty(self):
+        # If the top_level cell is itself a populated leaf, no zero-pop leaves needed.
+        cell = h3.latlng_to_cell(41.70, -71.55, 5)
+        pop_leaves = {cell}
+        top_level = {cell}
+        result = find_zero_pop_leaves(pop_leaves, top_level)
+        assert result == set()

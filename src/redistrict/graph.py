@@ -188,18 +188,18 @@ def nearest_node(
     if not candidates:
         raise ValueError("candidates list is empty")
     frac = math.sqrt(0.01)
-    lat_t, lon_t = target["lat"], target["lon"]
+    lat_t, lon_t = float(target["lat"]), float(target["lon"])
     indices = list(range(len(candidates)))
 
     k_lat = max(1, math.ceil(frac * len(indices)))
-    by_lat = sorted(indices, key=lambda i: abs(candidates[i]["lat"] - lat_t))[:k_lat]
+    by_lat = sorted(indices, key=lambda i: abs(float(candidates[i]["lat"]) - lat_t))[:k_lat]
 
     k_lon = max(1, math.ceil(frac * len(by_lat)))
-    by_lon = sorted(by_lat, key=lambda i: abs(candidates[i]["lon"] - lon_t))[:k_lon]
+    by_lon = sorted(by_lat, key=lambda i: abs(float(candidates[i]["lon"]) - lon_t))[:k_lon]
 
     best_i, best_d = -1, float("inf")
     for i in by_lon:
-        d = haversine_km(lat_t, lon_t, candidates[i]["lat"], candidates[i]["lon"])
+        d = haversine_km(lat_t, lon_t, float(candidates[i]["lat"]), float(candidates[i]["lon"]))
         if d < best_d:
             best_d, best_i = d, i
     return best_i

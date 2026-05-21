@@ -26,6 +26,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import h3
+from tqdm import tqdm
+
 from redistrict import db, graph, partition
 from redistrict import h3_graph
 
@@ -84,32 +87,65 @@ def main(statefp: str, n_districts: int) -> int:
 
         # --- H3 res-15 assignment (active only) ---
         print("\nAssigning blocks to H3 resolution-15...")
+        block_pops = {b["geoid"]: int(b["pop"]) for b in active_blocks}
         geoid_to_res15 = h3_graph.assign_h3_res15(active_blocks)
         print(f"  {len(set(geoid_to_res15.values())):,} unique res-15 cells.")
 
-        # --- Bottom-up aggregation ---
-        print("Aggregating H3 cells bottom-up...")
-        block_pops = {b["geoid"]: int(b["pop"]) for b in active_blocks}
-        geoid_to_cell = h3_graph.aggregate_h3_cells(
-            geoid_to_res15, block_pops, threshold,
+        # --- Build cell hierarchy ---
+        print("Building H3 cell hierarchy...")
+        cell_pop, cell_direct_children, populated_at_res = h3_graph.build_cell_hierarchy(
+            geoid_to_res15, block_pops,
         )
-        n_cells = len(set(geoid_to_cell.values()))
-        print(f"  {n_cells:,} aggregated cells (from {len(active_blocks):,} active blocks).")
+        print(f"  {len(cell_pop):,} populated cells across all resolutions.")
 
-        if n_districts >= n_cells:
-            print(f"Error: n_districts ({n_districts}) >= cell count ({n_cells}).")
+        # --- Leaf determination + provisional edges (populated only) ---
+        print("Computing leaves and provisional edges...")
+        pop_leaves, provisional_edges = h3_graph.compute_leaves_and_provisional_edges(
+            cell_pop, cell_direct_children, populated_at_res, threshold,
+        )
+        print(f"  {len(pop_leaves):,} populated leaf cells, "
+              f"{len(provisional_edges):,} provisional edges.")
+
+        # --- Zero-pop bridge leaves ---
+        top_level = h3_graph.compute_top_level(pop_leaves)
+        zero_pop_leaves = h3_graph.find_zero_pop_leaves(pop_leaves, top_level)
+        all_leaves = pop_leaves | zero_pop_leaves
+        print(f"  {len(zero_pop_leaves):,} zero-pop bridge leaves "
+              f"({len(all_leaves):,} total).")
+
+        # --- Adjacency across all leaves ---
+        print("Building adjacency...")
+        adjacency = h3_graph.build_h3_adjacency(
+            {L: L for L in all_leaves}, min_res=0,
+        )
+        print(f"  {len(adjacency):,} edges.")
+
+        # --- Assign geoids to populated leaves ---
+        geoid_to_cell = h3_graph.assign_geoids_to_leaves(geoid_to_res15, pop_leaves)
+        n_pop_cells = len(set(geoid_to_cell.values()))
+        print(f"  {n_pop_cells:,} populated leaf cells (from {len(active_blocks):,} active blocks).")
+
+        if n_districts >= n_pop_cells:
+            print(f"Error: n_districts ({n_districts}) >= cell count ({n_pop_cells}).")
             return
 
         # --- Population-weighted centroids ---
         print("Computing population-weighted centroids...")
         blocks_by_geoid = {b["geoid"]: b for b in blocks}
         cell_nodes = h3_graph.weighted_centroids(geoid_to_cell, blocks_by_geoid)
-        print(f"  {len(cell_nodes):,} cell nodes.")
 
-        # --- Adjacency ---
-        print("Building H3 adjacency graph...")
-        adjacency = h3_graph.build_h3_adjacency(geoid_to_cell)
-        print(f"  {len(adjacency):,} edges.")
+        # Append zero-pop bridge leaves
+        for leaf in zero_pop_leaves:
+            lat, lon = h3.cell_to_latlng(leaf)
+            cell_nodes.append({"cell": leaf, "pop": 0, "lat": lat, "lon": lon})
+        print(f"  {len(cell_nodes):,} cell nodes "
+              f"({len(zero_pop_leaves):,} zero-pop bridges).")
+
+        # --- Leaf visualisation (before METIS) ---
+        h3_graph.show_leaves(
+            all_leaves,
+            title=f"{state_name} — {len(all_leaves):,} leaves (threshold={threshold:,})",
+        )
 
         # --- Connectivity check ---
         components = h3_graph.check_connectivity(cell_nodes, adjacency)
@@ -134,8 +170,7 @@ def main(statefp: str, n_districts: int) -> int:
 
         # --- Post-assign zero-pop blocks to nearest active block's district ---
         if zero_pop_blocks:
-            print(f"  Assigning {len(zero_pop_blocks):,} zero-pop blocks to nearest district...")
-            for zb in zero_pop_blocks:
+            for zb in tqdm(zero_pop_blocks, desc="Assigning zero-pop blocks", unit="block"):
                 nearest_idx = graph.nearest_node(zb, active_blocks)
                 geoid_to_district[zb["geoid"]] = geoid_to_district[active_blocks[nearest_idx]["geoid"]]
 
@@ -153,22 +188,30 @@ def main(statefp: str, n_districts: int) -> int:
 
         # --- Write to DB ---
         params = {
-            "status":          "complete",
-            "method":          "h3_blocks",
-            "threshold":       threshold,
-            "n_blocks":        len(blocks),
-            "n_h3_cells":      n_cells,
-            "n_edges":         len(adjacency),
-            "n_components":    len(components),
-            "edge_cut":        edge_cut,
-            "ncuts":           NCUTS,
-            "niter":           NITER,
-            "recursive":       RECURSIVE,
+            "status":              "complete",
+            "method":              "h3_leaf",
+            "threshold":           threshold,
+            "n_blocks":            len(blocks),
+            "n_h3_cells":          n_pop_cells,
+            "n_h3_cells_total":    len(cell_nodes),
+            "n_provisional_edges": len(provisional_edges),
+            "n_edges":             len(adjacency),
+            "n_components":        len(components),
+            "edge_cut":            edge_cut,
+            "ncuts":               NCUTS,
+            "niter":               NITER,
+            "recursive":           RECURSIVE,
         }
-        print("\nWriting results to database...")
+        # --- District geometries (populated cells only, no zero-pop bridges) ---
+        print("\nBuilding district geometries from H3 cells...")
+        pop_cell_to_district = {c: d for c, d in cell_to_district.items()
+                                 if c in pop_leaves}
+        district_geoms = h3_graph.build_district_geoms(pop_cell_to_district, pop_per_district)
+
+        print("Writing results to database...")
         run_id = db.write_run(conn, "blocks", statefp, n_districts, params)
         db.write_assignments(conn, run_id, geoid_to_district)
-        db.write_district_geoms(conn, run_id, "blocks", geoid_to_district)
+        db.write_district_geoms_wkt(conn, run_id, district_geoms)
         print(f"  Run ID: {run_id}")
 
         # --- GeoJSON export ---
@@ -180,10 +223,10 @@ def main(statefp: str, n_districts: int) -> int:
         # --- Deviation log ---
         log_path = os.path.join(OUTPUT_DIR, f"{slug}_h3_run{run_id}_deviations.md")
         lines = [
-            f"# {state_name} — H3 blocks — {n_districts} districts — Run {run_id}",
+            f"# {state_name} — H3 leaf — {n_districts} districts — Run {run_id}",
             f"",
-            f"method=h3_blocks  threshold={threshold}  ncuts={NCUTS}  niter={NITER}",
-            f"blocks={len(blocks):,}  h3_cells={n_cells:,}  edges={len(adjacency):,}",
+            f"method=h3_leaf  threshold={threshold}  ncuts={NCUTS}  niter={NITER}",
+            f"blocks={len(blocks):,}  h3_cells={n_pop_cells:,}  edges={len(adjacency):,}",
             f"districts={n_districts}  ideal={ideal:,.0f}  worst_deviation={worst:.1f}%",
             f"",
             f"| District | Population | Deviation |",

@@ -479,3 +479,26 @@ def write_district_geoms(
                 (run_id, dist_id, geoids),
             )
     conn.commit()
+
+
+def write_district_geoms_wkt(
+    conn: psycopg2.extensions.connection,
+    run_id: int,
+    district_geoms: dict[int, tuple[str, int]],
+) -> None:
+    """
+    Write pre-computed district geometries (WKT, pop) to redistrict_districts.
+    district_geoms: district_id -> (wkt_multipolygon, population)
+    """
+    with conn.cursor() as cur:
+        for dist_id, (wkt, pop) in sorted(district_geoms.items()):
+            cur.execute(
+                """
+                INSERT INTO public.redistrict_districts (run_id, district_id, geom, pop20)
+                VALUES (%s, %s,
+                    ST_Multi(ST_GeomFromText(%s, 4326))::geometry(MultiPolygon, 4269),
+                    %s)
+                """,
+                (run_id, dist_id, wkt, pop),
+            )
+    conn.commit()

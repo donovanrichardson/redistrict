@@ -1,29 +1,26 @@
 """
 H3-based graph construction for redistricting directly from census blocks.
 
-Pipeline:
-  1. compute_threshold    - block pop at the 99th-percentile point by pop mass
-  2. assign_h3_res15      - map each block centroid to H3 resolution 15
-  3. aggregate_h3_cells   - bottom-up: find coarsest res where cell pop ≤ threshold
-  4. weighted_centroids   - pop-weighted centroid per aggregated cell
-  5. build_h3_adjacency   - adjacency via res-15 neighbour lookup
-  6. build_metis_graph    - uniform edge weight=1, node weight=pop
+Leaf-adjacency pipeline:
+  1. compute_threshold             - block pop at the 99th-percentile point by pop mass
+  2. assign_h3_res15               - map each block centroid to H3 resolution 15
+  3. build_cell_hierarchy          - accumulate pop and parent-child links (populated cells only)
+  4. compute_leaves_and_provisional_edges - bottom-up leaf determination + provisional edges
+  5. resolve_edges                 - confirm/redirect/discard provisional edges
+  6. assign_geoids_to_leaves       - map each geoid to its leaf cell
+  7. weighted_centroids            - pop-weighted centroid per leaf cell
+  8. build_metis_graph             - uniform edge weight=1, node weight=pop
 
 Threshold definition:
-  Sort blocks descending by population. Walk the list accumulating population
+  Sort blocks descending by population. Walk the sorted list accumulating population
   until the running total reaches 1% of the state total. The population of the
-  last block added at that point is the threshold — i.e. the block population
+  last block included is returned as the threshold — i.e. the block population
   at the 99th percentile of population mass.
 
-  Example: 1 block pop=100, 1500 blocks each pop≈6.6, total=10000.
-  1% target = 100. The first block (pop=100) hits the target → threshold = 100.
-
-Aggregation:
-  Blocks above threshold stay as individual res-15 nodes. All others are merged
-  bottom-up: at each resolution from 14 down to min_res, candidate cells are
-  grouped by their parent. If the parent's total pop ≤ threshold the children
-  are replaced by the parent. This continues until no further merging is
-  possible at the current resolution.
+Leaf definition:
+  A cell C at resolution R is a LEAF when its parent P satisfies:
+    cell_pop[P] > threshold  AND  P has >1 populated effective children (no leaf descendants).
+  Remaining res-0 cells with no leaf descendants are also marked as leaves.
 """
 
 from __future__ import annotations
@@ -32,6 +29,9 @@ import math
 from typing import Sequence
 
 import h3
+from shapely.geometry import MultiPolygon, Polygon
+from shapely.ops import unary_union
+from tqdm import tqdm
 
 
 MIN_CELL_POP = 1     # floor used as node weight in METIS
@@ -133,6 +133,215 @@ def aggregate_h3_cells(
     for cell, geoids in current.items():
         for g in geoids:
             result[g] = cell
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Leaf-adjacency pipeline (replaces aggregate_h3_cells + build_h3_adjacency)
+# ---------------------------------------------------------------------------
+
+def build_cell_hierarchy(
+    geoid_to_res15: dict[str, str],
+    block_pops: dict[str, int],
+) -> tuple[dict[str, int], dict[str, set[str]], dict[int, set[str]]]:
+    """
+    Accumulate population and parent-child relationships upward from res-15.
+    Only cells with population > 0 are included at any level.
+
+    Returns:
+        cell_pop: cell -> total population
+        cell_direct_children: cell -> set of direct populated children (at res+1)
+        populated_at_res: resolution -> set of populated cells at that resolution
+    """
+    cell_pop: dict[str, int] = {}
+    for geoid, cell in geoid_to_res15.items():
+        pop = block_pops.get(geoid, 0)
+        if pop > 0:
+            cell_pop[cell] = cell_pop.get(cell, 0) + pop
+
+    populated_at_res: dict[int, set[str]] = {15: set(cell_pop.keys())}
+    cell_direct_children: dict[str, set[str]] = {}
+
+    for res in range(14, -1, -1):
+        level: set[str] = set()
+        for child in populated_at_res.get(res + 1, set()):
+            parent = h3.cell_to_parent(child, res)
+            cell_pop[parent] = cell_pop.get(parent, 0) + cell_pop[child]
+            cell_direct_children.setdefault(parent, set()).add(child)
+            level.add(parent)
+        populated_at_res[res] = level
+
+    return cell_pop, cell_direct_children, populated_at_res
+
+
+def compute_leaves_and_provisional_edges(
+    cell_pop: dict[str, int],
+    cell_direct_children: dict[str, set[str]],
+    populated_at_res: dict[int, set[str]],
+    threshold: int,
+) -> tuple[set[str], set[tuple[str, str]]]:
+    """
+    Phase 1 (fine to coarse, res 14 -> 0):
+      For each populated cell P with no leaf descendants:
+        If cell_pop[P] > threshold and P has >1 effective children → mark children as leaves.
+    Phase 2 (triggered on mark_leaf):
+      Add provisional edges to same-resolution populated neighbors not yet a leaf ancestor.
+    Cleanup:
+      Remaining res-0 cells with no leaf descendants become leaves.
+
+    Returns (leaves, provisional_edges). Only populated cells become leaves here.
+    Zero-pop bridge leaves are added separately via find_zero_pop_leaves.
+    """
+    leaves: set[str] = set()
+    has_leaf_descendant: set[str] = set()
+    provisional_edges: set[tuple[str, str]] = set()
+
+    def _mark_leaf(cell: str) -> None:
+        leaves.add(cell)
+        res = h3.get_resolution(cell)
+        for r in range(res - 1, -1, -1):
+            anc = h3.cell_to_parent(cell, r)
+            if anc in has_leaf_descendant:
+                break
+            has_leaf_descendant.add(anc)
+        for neighbor in set(h3.grid_disk(cell, 1)) - {cell}:
+            if neighbor in cell_pop and neighbor not in has_leaf_descendant:
+                provisional_edges.add((cell, neighbor))
+
+    for res in range(14, -1, -1):
+        for P in populated_at_res.get(res, set()):
+            if P in has_leaf_descendant:
+                continue
+            effective_children = [
+                c for c in cell_direct_children.get(P, set())
+                if c not in has_leaf_descendant
+            ]
+            if cell_pop[P] > threshold and len(effective_children) > 1:
+                for child in effective_children:
+                    _mark_leaf(child)
+
+    for P in populated_at_res.get(0, set()):
+        if P not in has_leaf_descendant and P not in leaves:
+            _mark_leaf(P)
+
+    return leaves, provisional_edges
+
+
+def compute_top_level(leaves: set[str]) -> set[str]:
+    """
+    Find the tightest resolution at which all leaves share a single common ancestor.
+    Returns that single-element ancestor set, or all res-0 ancestors if none found.
+    """
+    if not leaves:
+        return set()
+    prev: set[str] = set()
+    for res in range(0, 16):
+        cur: set[str] = set()
+        for L in leaves:
+            L_res = h3.get_resolution(L)
+            cur.add(h3.cell_to_parent(L, res) if L_res > res else L)
+        if len(cur) > 1:
+            return prev if prev else cur
+        prev = cur
+    return prev
+
+
+def find_zero_pop_leaves(
+    populated_leaves: set[str],
+    top_level: set[str],
+) -> set[str]:
+    """
+    Post-pass: within the scope of top_level, every cell that is not a populated leaf
+    and has no populated-leaf descendant becomes a zero-pop leaf at the coarsest
+    resolution that is not an ancestor of a populated leaf.
+
+    BFS from each top_level cell downward. A cell is either:
+      - a populated leaf (terminal, no children needed)
+      - an ancestor of a populated leaf (expand its children)
+      - otherwise a zero-pop leaf (terminal)
+    """
+    has_leaf_descendant: set[str] = set()
+    for L in populated_leaves:
+        res = h3.get_resolution(L)
+        for r in range(res - 1, -1, -1):
+            anc = h3.cell_to_parent(L, r)
+            if anc in has_leaf_descendant:
+                break
+            has_leaf_descendant.add(anc)
+
+    zero_pop_leaves: set[str] = set()
+
+    for top_cell in top_level:
+        top_res = h3.get_resolution(top_cell)
+        if top_cell in populated_leaves:
+            continue
+        if top_cell not in has_leaf_descendant:
+            zero_pop_leaves.add(top_cell)
+            continue
+        frontier: list[str] = list(h3.cell_to_children(top_cell, top_res + 1))
+        for res in range(top_res + 1, 16):
+            next_frontier: list[str] = []
+            for cell in frontier:
+                if cell in populated_leaves:
+                    pass
+                elif cell in has_leaf_descendant:
+                    if res < 15:
+                        next_frontier.extend(h3.cell_to_children(cell, res + 1))
+                else:
+                    zero_pop_leaves.add(cell)
+            frontier = next_frontier
+
+    return zero_pop_leaves
+
+
+def resolve_edges(
+    provisional_edges: set[tuple[str, str]],
+    leaves: set[str],
+) -> set[tuple[str, str]]:
+    """
+    Phase 3: For each directed provisional_edge(A, N) where A is the originating leaf:
+      - N is a leaf              → confirm edge(A, N)
+      - N has a leaf ancestor    → redirect to edge(A, leaf_ancestor)
+      - else                     → discard
+
+    Returns undirected edges as sorted (min, max) tuples.
+    """
+    def _leaf_ancestor(cell: str) -> str | None:
+        res = h3.get_resolution(cell)
+        for r in range(res - 1, -1, -1):
+            anc = h3.cell_to_parent(cell, r)
+            if anc in leaves:
+                return anc
+        return None
+
+    confirmed: set[tuple[str, str]] = set()
+    for A, N in provisional_edges:
+        if N in leaves:
+            if A != N:
+                confirmed.add((min(A, N), max(A, N)))
+        else:
+            anc = _leaf_ancestor(N)
+            if anc is not None and anc != A:
+                confirmed.add((min(A, anc), max(A, anc)))
+    return confirmed
+
+
+def assign_geoids_to_leaves(
+    geoid_to_res15: dict[str, str],
+    leaves: set[str],
+) -> dict[str, str]:
+    """Map each geoid to its leaf cell by walking the ancestor chain."""
+    result: dict[str, str] = {}
+    for geoid, res15_cell in geoid_to_res15.items():
+        if res15_cell in leaves:
+            result[geoid] = res15_cell
+            continue
+        res = h3.get_resolution(res15_cell)
+        for r in range(res - 1, -1, -1):
+            anc = h3.cell_to_parent(res15_cell, r)
+            if anc in leaves:
+                result[geoid] = anc
+                break
     return result
 
 
@@ -308,3 +517,93 @@ def check_connectivity(
             stack.extend(adj[v])
         components.append(component)
     return components
+
+
+# ---------------------------------------------------------------------------
+# District geometry (Python/Shapely, no PostGIS required)
+# ---------------------------------------------------------------------------
+
+def build_district_geoms(
+    cell_to_district: dict[str, int],
+    pop_per_district: dict[int, int],
+) -> dict[int, tuple[str, int]]:
+    """
+    Compute district MultiPolygon geometries in Python using H3 cell boundaries.
+
+    For each district, union the Shapely polygons of all its leaf cells.
+    Returns district_id -> (wkt_geometry, population).
+    """
+    district_to_cells: dict[int, list[str]] = {}
+    for cell, dist in cell_to_district.items():
+        district_to_cells.setdefault(dist, []).append(cell)
+
+    result: dict[int, tuple[str, int]] = {}
+    for dist_id, cells in tqdm(sorted(district_to_cells.items()),
+                               desc="Building district geometries", unit="district"):
+        polys: list[Polygon] = []
+        for cell in cells:
+            boundary = h3.cell_to_boundary(cell)
+            # h3 returns (lat, lon) pairs; Shapely expects (lon, lat)
+            coords = [(lon, lat) for lat, lon in boundary]
+            polys.append(Polygon(coords))
+        geom = unary_union(polys)
+        if geom.geom_type == "Polygon":
+            geom = MultiPolygon([geom])
+        result[dist_id] = (geom.wkt, pop_per_district.get(dist_id, 0))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Leaf visualization
+# ---------------------------------------------------------------------------
+
+def show_leaves(
+    leaves: set[str],
+    title: str = "H3 Leaf Cells",
+) -> None:
+    """
+    Open a matplotlib window showing every leaf cell as an H3 hexagon,
+    coloured by resolution (fine = dark, coarse = light).
+    """
+    import geopandas as gpd
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import pandas as pd
+
+    rows = []
+    for cell in leaves:
+        boundary = h3.cell_to_boundary(cell)
+        coords = [(lon, lat) for lat, lon in boundary]
+        res = h3.get_resolution(cell)
+        rows.append({"geometry": Polygon(coords), "resolution": res})
+
+    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+
+    min_res = gdf["resolution"].min()
+    max_res = gdf["resolution"].max()
+
+    # Normalize resolution to [0, 1]: finer res → darker colour
+    cmap = plt.cm.get_cmap("YlOrRd_r")
+    norm = mcolors.Normalize(vmin=min_res, vmax=max(max_res, min_res + 1))
+    gdf["colour"] = gdf["resolution"].apply(lambda r: mcolors.to_hex(cmap(norm(r))))
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    gdf.plot(ax=ax, color=gdf["colour"], edgecolor="white", linewidth=0.3, alpha=0.85)
+
+    # Legend: one patch per resolution present
+    from matplotlib.patches import Patch
+    unique_res = sorted(gdf["resolution"].unique())
+    legend_elements = [
+        Patch(facecolor=mcolors.to_hex(cmap(norm(r))), edgecolor="grey",
+              label=f"res {r}  ({(gdf['resolution'] == r).sum():,} cells)")
+        for r in unique_res
+    ]
+    ax.legend(handles=legend_elements, loc="lower left", fontsize=8, title="Resolution")
+
+    ax.set_title(f"{title}\n{len(leaves):,} leaf cells  "
+                 f"(res {min_res}–{max_res})", fontsize=12)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_aspect("equal")
+    plt.tight_layout()
+    plt.show()
