@@ -163,6 +163,54 @@ def get_missing_adjacency_geoids(
         return [row[0] for row in cur.fetchall()]
 
 
+def compute_and_store_adjacency_bulk(
+    conn: psycopg2.extensions.connection,
+    geography: str,
+    statefp: str,
+) -> int:
+    """
+    Compute all rook-contiguous block pairs for a state in a single spatial join
+    and write them to {geography}_adjacency. Also marks all state geoids as logged.
+
+    Much faster than compute_and_store_adjacency for large states.
+    Returns total new pairs inserted.
+    """
+    _validate_geography(geography)
+    geo_table = f"public.{geography}_2020"
+    adj_table = f"public.{geography}_adjacency"
+    log_table = f"public.{geography}_adjacency_log"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO {adj_table} (geoid_a, geoid_b)
+            SELECT
+                LEAST(a.geoid20, b.geoid20),
+                GREATEST(a.geoid20, b.geoid20)
+            FROM {geo_table} a
+            JOIN {geo_table} b
+              ON a.statefp20 = b.statefp20
+             AND a.geoid20 < b.geoid20
+             AND ST_Touches(a.geom, b.geom)
+             AND ST_Dimension(ST_Intersection(a.geom, b.geom)) >= 1
+            WHERE a.statefp20 = %s
+            ON CONFLICT (geoid_a, geoid_b) DO NOTHING
+            """,
+            (statefp,),
+        )
+        total = cur.rowcount
+        cur.execute(
+            f"""
+            INSERT INTO {log_table} (geoid20)
+            SELECT geoid20 FROM {geo_table} WHERE statefp20 = %s
+            ON CONFLICT (geoid20) DO NOTHING
+            """,
+            (statefp,),
+        )
+    conn.commit()
+    return total
+
+
 def compute_and_store_adjacency(
     conn: psycopg2.extensions.connection,
     geography: str,
@@ -243,6 +291,23 @@ def fetch_adjacency(
             (geoids, geoids),
         )
         return {(r[0], r[1]) for r in cur.fetchall()}
+
+
+def fetch_block_geoms(
+    conn: psycopg2.extensions.connection,
+    statefp: str,
+) -> dict[str, str]:
+    """Return {geoid20: WKT} for all blocks in the state, reprojected to EPSG:4326."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT geoid20, ST_AsText(ST_Transform(geom, 4326))
+            FROM public.blocks_2020
+            WHERE statefp20 = %s
+            """,
+            (statefp,),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
 
 
 def write_run(
