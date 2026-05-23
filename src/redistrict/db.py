@@ -296,18 +296,23 @@ def fetch_adjacency(
 def fetch_block_geoms(
     conn: psycopg2.extensions.connection,
     statefp: str,
-) -> dict[str, str]:
-    """Return {geoid20: WKT} for all blocks in the state, reprojected to EPSG:4326."""
+) -> dict[str, bytes]:
+    """Return {geoid20: WKB bytes} for all blocks in the state in native EPSG:4269.
+
+    WKB (binary) preserves full double-precision coordinates. ST_AsText truncates
+    to ~6 decimal degrees, which breaks shared-edge topology of adjacent TIGER/LINE
+    blocks and produces stray lines when geometries are unioned.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT geoid20, ST_AsText(ST_Transform(geom, 4326))
+            SELECT geoid20, ST_AsEWKB(geom)
             FROM public.blocks_2020
             WHERE statefp20 = %s
             """,
             (statefp,),
         )
-        return {row[0]: row[1] for row in cur.fetchall()}
+        return {row[0]: bytes(row[1]) for row in cur.fetchall()}
 
 
 def write_run(
@@ -554,6 +559,7 @@ def write_district_geoms_wkt(
     """
     Write pre-computed district geometries (WKT, pop) to redistrict_districts.
     district_geoms: district_id -> (wkt_multipolygon, population)
+    WKT must be in native EPSG:4269 (no reprojection applied).
     """
     with conn.cursor() as cur:
         for dist_id, (wkt, pop) in sorted(district_geoms.items()):
@@ -561,7 +567,7 @@ def write_district_geoms_wkt(
                 """
                 INSERT INTO public.redistrict_districts (run_id, district_id, geom, pop20)
                 VALUES (%s, %s,
-                    ST_Multi(ST_Transform(ST_GeomFromText(%s, 4326), 4269)),
+                    ST_Multi(ST_GeomFromText(%s, 4269))::geometry(MultiPolygon, 4269),
                     %s)
                 """,
                 (run_id, dist_id, wkt, pop),

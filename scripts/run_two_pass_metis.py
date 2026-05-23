@@ -28,6 +28,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import numpy as np
+from shapely.ops import unary_union
 from tqdm import tqdm
 
 from redistrict import db, partition
@@ -227,16 +228,17 @@ def _show_cluster_graph(
     plt.pause(0.1)
 
 
+
 def _show_partition(
     geoid_to_part: dict[str, int],
-    block_geoms_wkt: dict[str, str],
+    block_geoms_wkb: dict[str, bytes],
     title: str,
 ) -> dict[int, object]:
     """
     Union block geometries by partition group, then plot.
     Returns {part_id: unioned_shapely_geometry} for reuse in subsequent plots.
     """
-    from shapely import wkt as swkt, get_parts
+    from shapely import wkb as swkb, get_parts
     from shapely.ops import unary_union
     import geopandas as gpd
     import matplotlib.pyplot as plt
@@ -246,9 +248,9 @@ def _show_partition(
     # Group geoms by partition
     groups: dict[int, list] = {}
     for geoid, part_id in geoid_to_part.items():
-        raw = block_geoms_wkt.get(geoid)
+        raw = block_geoms_wkb.get(geoid)
         if raw:
-            groups.setdefault(part_id, []).append(swkt.loads(raw))
+            groups.setdefault(part_id, []).append(swkb.loads(raw))
 
     print(f"  Unioning {sum(len(v) for v in groups.values()):,} block polygons "
           f"into {len(groups):,} groups...")
@@ -265,7 +267,7 @@ def _show_partition(
         polys = list(get_parts(geom))
         for poly in polys:
             rows.append({"geometry": poly, "colour": colour})
-    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4269")
 
     fig, ax = plt.subplots(figsize=(12, 10))
     gdf.plot(ax=ax, color=gdf["colour"], edgecolor="white", linewidth=0.3, alpha=0.85)
@@ -483,8 +485,8 @@ def main(statefp: str, n_districts: int) -> int:
 
         # --- Block geometries (for visualisation) ---
         print("\nFetching block geometries for visualisation...")
-        block_geoms_wkt = db.fetch_block_geoms(conn, statefp)
-        print(f"  {len(block_geoms_wkt):,} block polygons loaded.")
+        block_geoms_wkb = db.fetch_block_geoms(conn, statefp)
+        print(f"  {len(block_geoms_wkb):,} block polygons loaded.")
 
         # --- Rook adjacency ---
         geoids = [b["geoid"] for b in blocks]
@@ -565,7 +567,7 @@ def main(statefp: str, n_districts: int) -> int:
         # --- Pass 1 visualisation (after compaction so cluster IDs are consistent) ---
         geoid_to_cluster_viz = {b["geoid"]: full_membership_1c[i] for i, b in enumerate(blocks)}
         cluster_geoms = _show_partition(
-            geoid_to_cluster_viz, block_geoms_wkt,
+            geoid_to_cluster_viz, block_geoms_wkb,
             title=f"{state_name} — Pass 1: {n_clusters_actual:,} clusters "
                   f"(threshold={threshold:,})",
         )
@@ -629,7 +631,7 @@ def main(statefp: str, n_districts: int) -> int:
             district_geoms.setdefault(d, []).append(geom)
         rows2 = [{"geometry": unary_union(gs), "colour": dist_colour[d]}
                  for d, gs in district_geoms.items()]
-        gdf2 = gpd.GeoDataFrame(rows2, crs="EPSG:4326")
+        gdf2 = gpd.GeoDataFrame(rows2, crs="EPSG:4269")
         fig2, ax2 = plt.subplots(figsize=(12, 10))
         gdf2.plot(ax=ax2, color=gdf2["colour"], edgecolor="white", linewidth=0.5, alpha=0.9)
         legend_elements = [
@@ -673,11 +675,21 @@ def main(statefp: str, n_districts: int) -> int:
             "niter":           NITER,
             "recursive":       False,
         }
-        print("\nWriting results to database...")
+        print("\nBuilding district geometries from cluster geoms...")
+        district_cluster_geoms: dict[int, list] = {}
+        for c, geom in cluster_geoms.items():
+            d = cluster_to_district.get(c)
+            if d is not None:
+                district_cluster_geoms.setdefault(d, []).append(geom)
+        district_geoms_wkt: dict[int, tuple[str, int]] = {
+            dist_id: (unary_union(geoms).wkt, pop_per_district.get(dist_id, 0))
+            for dist_id, geoms in district_cluster_geoms.items()
+        }
+
+        print("Writing results to database...")
         run_id = db.write_run(conn, "blocks", statefp, n_districts, params)
         db.write_assignments(conn, run_id, block_to_district)
-        print("Building district geometries from census block shapes...")
-        db.write_district_geoms(conn, run_id, "blocks", block_to_district)
+        db.write_district_geoms_wkt(conn, run_id, district_geoms_wkt)
         print(f"  Run ID: {run_id}")
 
         # --- GeoJSON export ---
