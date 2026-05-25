@@ -204,13 +204,82 @@ def _build_subcluster_adj(
     subclusters: dict[int, list[str]],
     block_to_sub: dict[str, int],
     adjacency: set[tuple[str, str]],
+    sub_nodes: list[dict],
 ) -> set[tuple[str, str]]:
-    sub_adj: set[tuple[str, str]] = set()
+    """
+    Two subclusters are adjacent only if they share a rook block-pair edge AND
+    their centroids are connected in the Delaunay triangulation of all subcluster
+    centroids.  If a subcluster has rook neighbors but none pass the Delaunay
+    test, it is connected to its single closest rook neighbor (by centroid
+    distance) so it is not left isolated before bridging.
+    """
+    import numpy as np
+
+    # --- Step 1: rook subcluster pairs ---
+    rook_sub_adj: set[tuple[str, str]] = set()
+    rook_nbrs: dict[str, set[str]] = {}
     for a, b in adjacency:
         sa = block_to_sub.get(a)
         sb = block_to_sub.get(b)
         if sa is not None and sb is not None and sa != sb:
-            sub_adj.add((str(min(sa, sb)), str(max(sa, sb))))
+            ga, gb = str(min(sa, sb)), str(max(sa, sb))
+            rook_sub_adj.add((ga, gb))
+            rook_nbrs.setdefault(str(sa), set()).add(str(sb))
+            rook_nbrs.setdefault(str(sb), set()).add(str(sa))
+
+    if len(sub_nodes) < 3:
+        return rook_sub_adj
+
+    # --- Step 2: sphere convex hull neighbor pairs ---
+    # Project centroids onto the unit sphere, run 3D ConvexHull.
+    # Each simplex is a triangle; its 3 edges define spatial neighbors.
+    # This is equivalent to spherical Delaunay triangulation.
+    from scipy.spatial import ConvexHull
+
+    node_geoid = [n["geoid"] for n in sub_nodes]
+    lats = np.radians([float(n["lat"]) for n in sub_nodes])
+    lons = np.radians([float(n["lon"]) for n in sub_nodes])
+    pts3d = np.column_stack([
+        np.cos(lats) * np.cos(lons),
+        np.cos(lats) * np.sin(lons),
+        np.sin(lats),
+    ])
+    try:
+        hull = ConvexHull(pts3d)
+    except Exception:
+        return rook_sub_adj
+
+    delaunay_pairs: set[tuple[str, str]] = set()
+    for simplex in hull.simplices:   # each simplex is a triangle (3 vertices)
+        for i in range(3):
+            for j in range(i + 1, 3):
+                ga = node_geoid[simplex[i]]
+                gb = node_geoid[simplex[j]]
+                delaunay_pairs.add((min(ga, gb), max(ga, gb)))
+
+    # --- Step 3: keep only rook edges that are also Delaunay neighbors ---
+    sub_adj = rook_sub_adj & delaunay_pairs
+
+    # --- Step 4: fallback for subclusters whose every rook neighbor was pruned ---
+    cent: dict[str, tuple[float, float]] = {
+        n["geoid"]: (float(n["lat"]), float(n["lon"])) for n in sub_nodes
+    }
+    represented: set[str] = set()
+    for ga, gb in sub_adj:
+        represented.add(ga)
+        represented.add(gb)
+
+    for sid_str, nbrs in rook_nbrs.items():
+        if sid_str in represented:
+            continue
+        # All rook neighbors were pruned by Delaunay filter — attach to closest one
+        lat0, lon0 = cent[sid_str]
+        best = min(
+            nbrs,
+            key=lambda s: (cent[s][0] - lat0) ** 2 + (cent[s][1] - lon0) ** 2,
+        )
+        sub_adj.add((min(sid_str, best), max(sid_str, best)))
+
     return sub_adj
 
 
@@ -385,6 +454,62 @@ def _add_bridge_edges(
 
     print(f"  Added {n_bridges} bridge edge(s). Subcluster graph now fully connected.")
     return augmented, n_bridges, comp_of
+
+
+def _show_subcluster_adjacency(
+    sub_nodes: list[dict],
+    sub_adj_rook: set[tuple[str, str]],
+    sub_adj_bridges: set[tuple[str, str]],
+    sub_geoms: dict[int, object],
+    title: str,
+) -> None:
+    """Plot subcluster polygons overlaid with rook edges (blue) and bridge edges (red)."""
+    import geopandas as gpd
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import matplotlib.lines as mlines
+
+    # Node centroid lookup: geoid str -> (lon, lat) for matplotlib (x, y)
+    cent: dict[str, tuple[float, float]] = {
+        n["geoid"]: (float(n["lon"]), float(n["lat"])) for n in sub_nodes
+    }
+
+    n_parts = len(sub_geoms)
+    cmap = plt.cm.get_cmap("tab20")
+    part_colour = {p: mcolors.to_hex(cmap((i % 20) / 20))
+                   for i, p in enumerate(sorted(sub_geoms))}
+
+    rows = [{"geometry": geom, "colour": part_colour[pid]}
+            for pid, geom in sub_geoms.items()]
+    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4269")
+
+    fig, ax = plt.subplots(figsize=(14, 11))
+    gdf.plot(ax=ax, color=gdf["colour"], edgecolor="white", linewidth=0.3, alpha=0.75)
+
+    for ga, gb in sub_adj_rook:
+        if ga in cent and gb in cent:
+            x0, y0 = cent[ga]
+            x1, y1 = cent[gb]
+            ax.plot([x0, x1], [y0, y1], color="#3B82F6", linewidth=0.6, alpha=0.5)
+
+    for ga, gb in sub_adj_bridges:
+        if ga in cent and gb in cent:
+            x0, y0 = cent[ga]
+            x1, y1 = cent[gb]
+            ax.plot([x0, x1], [y0, y1], color="#EF4444", linewidth=2.0, alpha=0.9, zorder=5)
+
+    legend_elems = [
+        mlines.Line2D([], [], color="#3B82F6", linewidth=1.5, label=f"Rook ({len(sub_adj_rook):,})"),
+        mlines.Line2D([], [], color="#EF4444", linewidth=2.0, label=f"Bridge ({len(sub_adj_bridges):,})"),
+    ]
+    ax.legend(handles=legend_elems, loc="lower left", fontsize=9)
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_aspect("equal")
+    plt.tight_layout()
+    plt.show(block=False)
+    plt.pause(0.1)
 
 
 def _show_partition(
@@ -610,14 +735,22 @@ def main(statefp: str, n_districts: int) -> None:
 
         # --- Build subcluster nodes and adjacency ---
         sub_nodes = _build_subcluster_nodes(subclusters, blocks_by_geoid)
-        sub_adj = _build_subcluster_adj(subclusters, block_to_sub, rook_adjacency)
+        sub_adj = _build_subcluster_adj(subclusters, block_to_sub, rook_adjacency, sub_nodes)
 
         # --- Bridge disconnected subcluster components ---
         print("\nChecking subcluster graph connectivity...")
+        sub_adj_rook = set(sub_adj)
         sub_adj, n_bridges, sub_comp_of = _add_bridge_edges(
             sub_nodes, sub_adj,
             node_geoms={str(sid): sub_geoms[sid]
                         for sid in subclusters if sid in sub_geoms},
+        )
+        sub_adj_bridges = sub_adj - sub_adj_rook
+
+        _show_subcluster_adjacency(
+            sub_nodes, sub_adj_rook, sub_adj_bridges, sub_geoms,
+            title=f"{state_name} — subcluster adjacency after bridging "
+                  f"({len(sub_adj_rook):,} rook + {len(sub_adj_bridges)} bridge)",
         )
 
         # --- Final METIS: equal edge weights, k = n_districts ---
