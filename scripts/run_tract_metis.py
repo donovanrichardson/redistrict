@@ -154,7 +154,7 @@ def _bisect(
     try:
         _, membership = partition.partition(
             adjacency_lists, edge_weights, node_weights, 2,
-            ncuts=NCUTS_BISECT, niter=NITER_BISECT, recursive=True,
+            ncuts=NCUTS_BISECT, niter=NITER_BISECT,
         )
     except Exception:
         return [geoid_list]
@@ -284,7 +284,7 @@ def _build_subcluster_adj(
         lat0, lon0 = centroids[subcluster_id_str]
         best_subcluster_id = min(
             neighbours,
-            key=lambda s: (centroids[s][0] - lat0) ** 2 + (centroids[s][1] - lon0) ** 2,
+            key=lambda s: _haversine_km(lat0, lon0, centroids[s][0], centroids[s][1]),
         )
         subcluster_adjacency.add((min(subcluster_id_str, best_subcluster_id), max(subcluster_id_str, best_subcluster_id)))
 
@@ -294,18 +294,15 @@ def _build_subcluster_adj(
 def _add_bridge_edges(
     blocks: list[dict],
     adjacency: set[tuple[str, str]],
-    node_geoms: dict[str, object] | None = None,
 ) -> tuple[set[tuple[str, str]], int, list[int]]:
     """
-    Detect disconnected components and add minimum bridge edges (Kruskal's on
-    combined convex hull of per-component external nodes).  When node_geoms is
-    provided, external nodes are those whose geometry touches the component's
-    exterior ring (excluding bay-facing nodes).
+    Detect disconnected components and add bridge edges.
+    External nodes per component are determined by the 2D lat/lon convex hull
+    of centroid coordinates within the component.
 
     Returns (augmented_adjacency, n_bridges_added, comp_of).
     """
     from scipy.spatial import ConvexHull
-    from shapely.ops import unary_union
 
     geoid_list = [b["geoid"] for b in blocks]
     index_of = {geoid: index for index, geoid in enumerate(geoid_list)}
@@ -348,54 +345,20 @@ def _add_bridge_edges(
                       for j in range(min(component_count, 5)))
           + ("..." if component_count > 5 else ""))
 
-    def _iter_exteriors(geometry):
-        if geometry.geom_type == "Polygon":
-            yield geometry.exterior
-        elif geometry.geom_type in ("MultiPolygon", "GeometryCollection"):
-            for part in geometry.geoms:
-                yield from _iter_exteriors(part)
-
     exterior_points: list[tuple[float, float]] = []
     exterior_component_indices: list[int] = []
     exterior_block_indices: list[int] = []
 
     for component_index, component in enumerate(components):
-        hull_indices: list[int]
-        component_polygons = (
-            [node_geoms[blocks[block_index]["geoid"]]
-             for block_index in component
-             if blocks[block_index]["geoid"] in node_geoms]
-            if node_geoms else []
-        )
-        if component_polygons:
-            component_union = unary_union(component_polygons)
-            exteriors = list(_iter_exteriors(component_union))
-            if exteriors:
-                exterior_ring_union = unary_union(exteriors)
-                hull_indices = [
-                    block_index for block_index in component
-                    if node_geoms.get(blocks[block_index]["geoid"]) is not None
-                    and node_geoms[blocks[block_index]["geoid"]].intersects(exterior_ring_union)
-                ]
-                if not hull_indices:
-                    hull_indices = component
-            else:
-                hull_indices = component
-        elif len(component) < 4:
+        if len(component) < 3:
             hull_indices = component
         else:
-            component_lats_rad = np.radians([float(blocks[block_index]["lat"]) for block_index in component])
-            component_lons_rad = np.radians([float(blocks[block_index]["lon"]) for block_index in component])
-            component_sphere_pts = np.column_stack([
-                np.cos(component_lats_rad) * np.cos(component_lons_rad),
-                np.cos(component_lats_rad) * np.sin(component_lons_rad),
-                np.sin(component_lats_rad),
+            component_pts = np.column_stack([
+                [float(blocks[block_index]["lat"]) for block_index in component],
+                [float(blocks[block_index]["lon"]) for block_index in component],
             ])
             try:
-                component_hull_vertices: set[int] = set()
-                for simplex in ConvexHull(component_sphere_pts).simplices:
-                    component_hull_vertices.update(simplex)
-                hull_indices = [component[v] for v in component_hull_vertices]
+                hull_indices = [component[v] for v in ConvexHull(component_pts).vertices]
             except Exception:
                 hull_indices = component
 
@@ -406,7 +369,6 @@ def _add_bridge_edges(
 
     # Spherical convex hull over all exterior centroids projected onto unit sphere
     bridge_candidates: list[tuple[float, int, int, int, int]] = []
-    hull_simplex_edges: list[tuple[int, int]] = []
     latitudes_rad  = np.radians([point[0] for point in exterior_points])
     longitudes_rad = np.radians([point[1] for point in exterior_points])
     sphere_points = np.column_stack([
@@ -420,7 +382,6 @@ def _add_bridge_edges(
             for i in range(3):
                 for j in range(i + 1, 3):
                     ai, aj = int(simplex[i]), int(simplex[j])
-                    hull_simplex_edges.append((ai, aj))
                     ca, cj = exterior_component_indices[ai], exterior_component_indices[aj]
                     if ca != cj:
                         ba, bj = exterior_block_indices[ai], exterior_block_indices[aj]
@@ -431,49 +392,6 @@ def _add_bridge_edges(
                         bridge_candidates.append((distance, ba, bj, ca, cj))
     except Exception:
         pass
-
-    # Plot subcluster polygons colored by component, with sphere hull bridge edges overlaid
-    import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
-    import matplotlib.patches as mpatches
-    fig, axis = plt.subplots(figsize=(14, 11))
-    cmap = plt.cm.get_cmap("tab20")
-    for block_index, block in enumerate(blocks):
-        component_index = component_index_of[block_index]
-        colour = mcolors.to_hex(cmap((component_index % 20) / 20))
-        geoid = block["geoid"]
-        if node_geoms and geoid in node_geoms:
-            geom = node_geoms[geoid]
-            try:
-                import geopandas as gpd
-                gpd.GeoDataFrame(geometry=[geom]).plot(
-                    ax=axis, color=colour, edgecolor="white", linewidth=0.3, alpha=0.7
-                )
-            except Exception:
-                pass
-        axis.plot(float(block["lon"]), float(block["lat"]), "o", color=colour,
-                  markersize=4, alpha=1.0, zorder=4)
-    for ai, aj in hull_simplex_edges:
-        lat_a, lon_a = exterior_points[ai]
-        lat_j, lon_j = exterior_points[aj]
-        ca, cj = exterior_component_indices[ai], exterior_component_indices[aj]
-        if ca != cj:
-            axis.plot([lon_a, lon_j], [lat_a, lat_j], "-", color="red",
-                      linewidth=1.2, alpha=0.9, zorder=5)
-        else:
-            axis.plot([lon_a, lon_j], [lat_a, lat_j], "-", color="gray",
-                      linewidth=0.3, alpha=0.3, zorder=1)
-    axis.set_title(
-        f"Sphere hull bridge candidates: {component_count} components, "
-        f"{len(bridge_candidates)} cross-component edges",
-        fontsize=11,
-    )
-    axis.set_xlabel("Longitude")
-    axis.set_ylabel("Latitude")
-    axis.set_aspect("equal")
-    plt.tight_layout()
-    plt.show(block=False)
-    plt.pause(0.1)
 
     # Group candidates by component pair; for each pair add the shortest 1/3 (min 1)
     from tqdm import tqdm
@@ -811,8 +729,6 @@ def main(statefp: str, n_districts: int) -> None:
         subcluster_rook_adjacency = set(sub_adj)
         sub_adj, bridge_count, subcluster_component_of = _add_bridge_edges(
             subcluster_nodes, sub_adj,
-            node_geoms={str(subcluster_id): subcluster_geoms[subcluster_id]
-                        for subcluster_id in subclusters if subcluster_id in subcluster_geoms},
         )
         subcluster_bridge_adjacency = sub_adj - subcluster_rook_adjacency
 
@@ -970,9 +886,10 @@ def main(statefp: str, n_districts: int) -> None:
                         else [n["geoid"] for n in subcluster_nodes]
                     best_subcluster_geoid = min(
                         candidates,
-                        key=lambda geoid_str: (
-                            (float(subcluster_nodes_by_geoid[geoid_str]["lat"]) - component_lat) ** 2
-                            + (float(subcluster_nodes_by_geoid[geoid_str]["lon"]) - component_lon) ** 2
+                        key=lambda geoid_str: _haversine_km(
+                            component_lat, component_lon,
+                            float(subcluster_nodes_by_geoid[geoid_str]["lat"]),
+                            float(subcluster_nodes_by_geoid[geoid_str]["lon"]),
                         ),
                     )
                     best_district = subcluster_to_district[int(best_subcluster_geoid)]
