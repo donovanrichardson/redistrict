@@ -32,7 +32,7 @@ from shapely.ops import unary_union
 from tqdm import tqdm
 
 from redistrict import db, partition
-from redistrict.h3_graph import compute_threshold
+
 
 _FIPS_TO_NAME = {
     "01": "Alabama",       "04": "Arizona",        "05": "Arkansas",
@@ -73,18 +73,28 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def _add_bridge_edges(
     blocks: list[dict],
     adjacency: set[tuple[str, str]],
-) -> tuple[set[tuple[str, str]], int]:
+    node_geoms: dict[str, object] | None = None,
+) -> tuple[set[tuple[str, str]], int, list[int]]:
     """
-    Detect disconnected components in the block graph and add bridge edges so
-    the graph becomes fully connected.
+    Detect disconnected components and add the minimum set of bridge edges to make
+    the graph fully connected.
 
-    Uses a minimum spanning tree over components: each bridge connects the two
-    nearest blocks from any two currently-disconnected components, so island
-    chains connect to their geographic neighbor rather than all jumping directly
-    to the mainland.
+    For each component, identifies external nodes (those on the true outer boundary).
+    When node_geoms is provided, unions the component's pre-computed geometries and
+    keeps only nodes whose centroids lie on the exterior ring(s), excluding nodes that
+    face interior holes or bays. Falls back to convex hull when no geometries are given.
 
-    Returns (augmented_adjacency, n_bridges_added).
+    All external nodes across all components are pooled into a single convex hull, whose
+    edges naturally span component boundaries. Those cross-component edges are sorted
+    by haversine distance and consumed greedily (Kruskal's) until all components are
+    joined. Falls back to nearest-centroid pairing for any components not reached by
+    the combined hull (e.g. fully interior islands).
+
+    Returns (augmented_adjacency, n_bridges_added, comp_of).
     """
+    from scipy.spatial import ConvexHull
+    from shapely.ops import unary_union as _unary_union
+
     geoid_list = [b["geoid"] for b in blocks]
     idx_of = {g: i for i, g in enumerate(geoid_list)}
     n = len(geoid_list)
@@ -119,7 +129,7 @@ def _add_bridge_edges(
     k = len(components)
     if k == 1:
         print(f"  Graph is fully connected ({n:,} blocks, 1 component).")
-        return adjacency, 0
+        return adjacency, 0, comp_of
 
     block_pops = [int(b["pop"]) for b in blocks]
     comp_pops = [sum(block_pops[i] for i in comp) for comp in components]
@@ -128,65 +138,135 @@ def _add_bridge_edges(
                       for j in range(min(k, 5)))
           + ("..." if k > 5 else ""))
 
-    # Pre-build per-component lat/lon arrays, then reduce to convex hull vertices
-    from scipy.spatial import ConvexHull
+    # Step 1: collect external nodes per component.
+    # With node_geoms: union pre-computed geometries, extract exterior rings only,
+    # then keep only nodes whose centroids touch that outer boundary.
+    # Without node_geoms: fall back to convex hull of the centroid point cloud.
+    ext_pts: list[tuple[float, float]] = []  # (lat, lon)
+    ext_comp: list[int] = []                 # component index
+    ext_block: list[int] = []               # block index
 
-    def _hull_indices(comp: list[int]) -> list[int]:
-        """Return the subset of comp indices that lie on the convex hull.
-        Falls back to all indices when the component is too small for a hull."""
-        if len(comp) < 4:
-            return comp
-        pts = np.column_stack([
-            [float(blocks[i]["lat"]) for i in comp],
-            [float(blocks[i]["lon"]) for i in comp],
-        ])
-        try:
-            hull = ConvexHull(pts)
-            return [comp[v] for v in hull.vertices]
-        except Exception:
-            return comp
+    for ci, comp in enumerate(components):
+        hull_idx: list[int]
 
-    hull_comps = [_hull_indices(comp) for comp in components]
+        comp_polys = (
+            [node_geoms[blocks[bi]["geoid"]]
+             for bi in comp
+             if blocks[bi]["geoid"] in node_geoms]
+            if node_geoms else []
+        )
 
-    comp_lats = [np.array([float(blocks[i]["lat"]) for i in h]) for h in hull_comps]
-    comp_lons = [np.array([float(blocks[i]["lon"]) for i in h]) for h in hull_comps]
-    comp_idx  = [np.array(h) for h in hull_comps]
+        if comp_polys:
+            comp_union = _unary_union(comp_polys)
+            exteriors = []
+            if comp_union.geom_type == "Polygon":
+                exteriors.append(comp_union.exterior)
+            elif comp_union.geom_type == "MultiPolygon":
+                for part in comp_union.geoms:
+                    exteriors.append(part.exterior)
 
-    def _nearest_pair(ci: int, cj: int) -> tuple[int, int, float]:
-        """Return (block_idx_in_ci, block_idx_in_cj, sq_dist) using hull vertices."""
-        lats_i, lons_i = comp_lats[ci], comp_lons[ci]
-        lats_j, lons_j = comp_lats[cj], comp_lons[cj]
-        dlat = lats_i[:, None] - lats_j[None, :]
-        dlon = lons_i[:, None] - lons_j[None, :]
-        sq = dlat ** 2 + dlon ** 2
-        flat = int(np.argmin(sq))
-        ri, rj = divmod(flat, len(lats_j))
-        return int(comp_idx[ci][ri]), int(comp_idx[cj][rj]), float(sq[ri, rj])
+            if exteriors:
+                # A cluster borders the outer boundary if its geometry intersects
+                # any exterior ring (shared edge or corner with the outer perimeter).
+                ext_ring_union = _unary_union(exteriors)
+                hull_idx = [
+                    bi for bi in comp
+                    if node_geoms.get(blocks[bi]["geoid"]) is not None
+                    and node_geoms[blocks[bi]["geoid"]].intersects(ext_ring_union)
+                ]
+                if not hull_idx:
+                    hull_idx = comp
+            else:
+                hull_idx = comp
+        elif len(comp) < 4:
+            hull_idx = comp
+        else:
+            pts = np.column_stack([
+                [float(blocks[i]["lat"]) for i in comp],
+                [float(blocks[i]["lon"]) for i in comp],
+            ])
+            try:
+                hull_idx = [comp[v] for v in ConvexHull(pts).vertices]
+            except Exception:
+                hull_idx = comp
 
-    # Prim's MST over the k components (k is tiny, O(k^2) is fine)
-    in_tree = {0}
+        for bi in hull_idx:
+            ext_pts.append((float(blocks[bi]["lat"]), float(blocks[bi]["lon"])))
+            ext_comp.append(ci)
+            ext_block.append(bi)
+
+    # Step 2: single combined hull over all external nodes → cross-component edges
+    candidates: list[tuple[float, int, int, int, int]] = []  # (dist, bi, bj, ci, cj)
+    ext_arr = np.array(ext_pts)
+    try:
+        combined = ConvexHull(ext_arr)
+        for simplex in combined.simplices:
+            ai, aj = int(simplex[0]), int(simplex[1])
+            ca, cj = ext_comp[ai], ext_comp[aj]
+            if ca != cj:
+                ba, bj = ext_block[ai], ext_block[aj]
+                d = _haversine_km(
+                    float(blocks[ba]["lat"]), float(blocks[ba]["lon"]),
+                    float(blocks[bj]["lat"]), float(blocks[bj]["lon"]),
+                )
+                candidates.append((d, ba, bj, ca, cj))
+    except Exception:
+        pass
+    candidates.sort()
+
+    # Step 3: Kruskal's union-find to add minimum bridges
+    parent = list(range(k))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
     augmented = set(adjacency)
     n_bridges = 0
 
-    with tqdm(total=k - 1, desc="  Bridging components", unit="bridge") as pbar:
-        while len(in_tree) < k:
-            best = (float("inf"), -1, -1, -1, -1)  # (dist, ci, cj, bi, bj)
-            for ci in in_tree:
-                for cj in range(k):
-                    if cj in in_tree:
-                        continue
-                    bi, bj, sq = _nearest_pair(ci, cj)
-                    if sq < best[0]:
-                        best = (sq, ci, cj, bi, bj)
-            sq, ci, cj, bi, bj = best
+    for d, bi, bj, ca, cj in candidates:
+        if _find(ca) != _find(cj):
             ga, gb = geoid_list[bi], geoid_list[bj]
             augmented.add((min(ga, gb), max(ga, gb)))
-            in_tree.add(cj)
+            parent[_find(ca)] = _find(cj)
             n_bridges += 1
-            pbar.update(1)
+        if n_bridges == k - 1:
+            break
+
+    # Fallback: for components not reached by the combined hull (e.g. a component
+    # whose external nodes are fully enclosed by another component's hull), find the
+    # nearest cross-component pair of external nodes by haversine and bridge them.
+    # Each external node's lat/lon is already its population-weighted centroid.
+    if n_bridges < k - 1:
+        # Each entry: (haversine_km, block_idx_a, block_idx_b, component_a, component_b)
+        # Sorted ascending so Kruskal's consumes shortest bridges first.
+        fallback_candidates: list[tuple[float, int, int, int, int]] = []
+        n_ext = len(ext_block)
+        for ai in range(n_ext):
+            for aj in range(ai + 1, n_ext):
+                ca, cj = ext_comp[ai], ext_comp[aj]
+                # Skip pairs already in the same component tree
+                if _find(ca) == _find(cj):
+                    continue
+                lat_a, lon_a = ext_pts[ai]
+                lat_j, lon_j = ext_pts[aj]
+                d = _haversine_km(lat_a, lon_a, lat_j, lon_j)
+                fallback_candidates.append((d, ext_block[ai], ext_block[aj], ca, cj))
+        fallback_candidates.sort()
+        # Kruskal's: add shortest bridge that joins two still-disconnected components
+        for d, bi, bj, ca, cj in fallback_candidates:
+            if _find(ca) != _find(cj):
+                ga, gb = geoid_list[bi], geoid_list[bj]
+                augmented.add((min(ga, gb), max(ga, gb)))
+                parent[_find(ca)] = _find(cj)
+                n_bridges += 1
+            if n_bridges == k - 1:
+                break
 
     print(f"  Added {n_bridges} bridge edge(s). Graph now fully connected.")
-    return augmented, n_bridges
+    return augmented, n_bridges, comp_of
 
 
 def _show_cluster_graph(
@@ -478,9 +558,9 @@ def main(statefp: str, n_districts: int) -> int:
         print(f"  Total population: {total_pop:,}")
 
         # --- Threshold ---
-        threshold = compute_threshold(active_blocks)
+        threshold = 3000
         n_clusters_target = max(2, min(math.ceil(total_pop / threshold), n_blocks - 1))
-        print(f"\nThreshold (99th pct by pop mass): {threshold:,}")
+        print(f"\nThreshold (min cluster pop): {threshold:,}")
         print(f"  Pass-1 target clusters: {n_clusters_target:,}")
 
         # --- Block geometries (for visualisation) ---
@@ -499,11 +579,12 @@ def main(statefp: str, n_districts: int) -> int:
         else:
             print("  Adjacency fully cached.")
         block_adjacency = db.fetch_adjacency(conn, "blocks", geoids)
+        rook_adjacency = set(block_adjacency)   # snapshot before synthetic bridge edges
         print(f"  {len(block_adjacency):,} rook-adjacent block pairs.")
 
         # --- Bridge disconnected island components (populated only) ---
         print("\nChecking graph connectivity...")
-        block_adjacency, n_bridges = _add_bridge_edges(active_blocks, block_adjacency)
+        block_adjacency, n_bridges, _ = _add_bridge_edges(active_blocks, block_adjacency)
 
         # --- Pass 1: populated blocks → clusters ---
         print(f"\nPass 1 METIS: {len(active_blocks):,} populated blocks "
@@ -526,31 +607,97 @@ def main(statefp: str, n_districts: int) -> int:
         print(f"  {n_clusters_actual:,} clusters, "
               f"ideal pop {ideal_cluster:,.0f}, worst deviation {worst_cluster:.1f}%")
 
-        # --- Assign zero-pop blocks to nearest cluster centroid ---
+        # --- Assign zero-pop blocks by adjacency, then isolated groups get own clusters ---
         geoid_to_cluster: dict[str, int] = {
             active_blocks[i]["geoid"]: membership_1[i]
             for i in range(len(active_blocks))
         }
         if zero_pop_blocks:
+            zero_pop_geoids = {b["geoid"] for b in zero_pop_blocks}
+            zp_by_geoid = {b["geoid"]: b for b in zero_pop_blocks}
+
+            # Build neighbour lookup for every zero-pop block (rook adjacency only)
+            zp_nbrs: dict[str, list[str]] = {g: [] for g in zero_pop_geoids}
+            for a, b_g in rook_adjacency:
+                if a in zero_pop_geoids:
+                    zp_nbrs[a].append(b_g)
+                if b_g in zero_pop_geoids:
+                    zp_nbrs[b_g].append(a)
+
+            # Cluster centroids from populated blocks (used to break ties)
             clust_lat: dict[int, list] = {}
             clust_lon: dict[int, list] = {}
             for b in active_blocks:
                 c = geoid_to_cluster[b["geoid"]]
                 clust_lat.setdefault(c, []).append(float(b["lat"]))
                 clust_lon.setdefault(c, []).append(float(b["lon"]))
-            clust_ids = sorted(clust_lat)
-            cent_lats = np.array([sum(clust_lat[c]) / len(clust_lat[c]) for c in clust_ids])
-            cent_lons = np.array([sum(clust_lon[c]) / len(clust_lon[c]) for c in clust_ids])
-            for b in zero_pop_blocks:
-                lat, lon = float(b["lat"]), float(b["lon"])
-                d = (cent_lats - lat) ** 2 + (cent_lons - lon) ** 2
-                geoid_to_cluster[b["geoid"]] = clust_ids[int(np.argmin(d))]
-            print(f"  {len(zero_pop_blocks):,} zero-pop blocks assigned to nearest cluster.")
+            clust_cent: dict[int, tuple[float, float]] = {
+                c: (sum(clust_lat[c]) / len(clust_lat[c]),
+                    sum(clust_lon[c]) / len(clust_lon[c]))
+                for c in clust_lat
+            }
+
+            # BFS wave-front: assign zero-pop blocks that are rook-adjacent to any
+            # already-assigned block, picking the adjacent cluster with the nearest centroid.
+            unassigned = set(zero_pop_geoids)
+            changed = True
+            while changed:
+                changed = False
+                for geoid in list(unassigned):
+                    adj_clusters = {
+                        geoid_to_cluster[nb]
+                        for nb in zp_nbrs[geoid]
+                        if nb in geoid_to_cluster
+                    }
+                    if not adj_clusters:
+                        continue
+                    b = zp_by_geoid[geoid]
+                    lat, lon = float(b["lat"]), float(b["lon"])
+                    best = min(
+                        adj_clusters,
+                        key=lambda c: (
+                            (clust_cent[c][0] - lat) ** 2 + (clust_cent[c][1] - lon) ** 2
+                            if c in clust_cent else float("inf")
+                        ),
+                    )
+                    geoid_to_cluster[geoid] = best
+                    unassigned.discard(geoid)
+                    changed = True
+
+            # Remaining zero-pop blocks have no rook path to any populated cluster.
+            # Group them into contiguous components and give each component its own cluster.
+            if unassigned:
+                next_id = max(geoid_to_cluster.values()) + 1
+                visited: set[str] = set()
+                n_new = 0
+                for start in unassigned:
+                    if start in visited:
+                        continue
+                    comp: list[str] = [start]
+                    queue = [start]
+                    visited.add(start)
+                    while queue:
+                        node = queue.pop()
+                        for nb in zp_nbrs[node]:
+                            if nb in unassigned and nb not in visited:
+                                visited.add(nb)
+                                queue.append(nb)
+                                comp.append(nb)
+                    for geoid in comp:
+                        geoid_to_cluster[geoid] = next_id
+                    next_id += 1
+                    n_new += 1
+                print(f"  {len(unassigned):,} isolated zero-pop blocks → {n_new} new cluster(s).")
+
+            n_assigned = len(zero_pop_geoids) - len(unassigned) if unassigned else len(zero_pop_geoids)
+            print(f"  {n_assigned:,} zero-pop blocks assigned by rook adjacency.")
 
         # --- Contiguity repair: split non-contiguous clusters into singleparts ---
+        # Use rook_adjacency (no synthetic bridge edges) so bridged-but-non-touching
+        # block pairs are correctly identified as disconnected and split.
         print("Repairing Pass 1 contiguity...")
         geoid_to_cluster, n_splits = _repair_pass1_contiguity(
-            geoid_to_cluster, block_adjacency,
+            geoid_to_cluster, rook_adjacency,
         )
         n_clusters_actual = len(set(geoid_to_cluster.values()))
         print(f"  {n_splits:,} fragments split off → {n_clusters_actual:,} clusters total.")
@@ -564,6 +711,19 @@ def main(statefp: str, n_districts: int) -> int:
             blocks, full_membership_1, block_adjacency,
         )
 
+        # --- Pass 1 cluster population summary (populated clusters only) ---
+        cluster_pops_final = sorted(n["pop"] for n in cluster_nodes if n["pop"] > 0)
+        n_c = len(cluster_pops_final)
+        pctiles = [0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100]
+        def _pct(p):
+            idx = min(int(p / 100 * n_c), n_c - 1)
+            return cluster_pops_final[idx]
+        print("\nPass 1 cluster population percentiles:")
+        print(f"  n={n_c:,}  mean={sum(cluster_pops_final)//n_c:,}")
+        print(f"  {'pct':>5}  {'pop':>10}")
+        for p in pctiles:
+            print(f"  {p:>4}%  {_pct(p):>10,}")
+
         # --- Pass 1 visualisation (after compaction so cluster IDs are consistent) ---
         geoid_to_cluster_viz = {b["geoid"]: full_membership_1c[i] for i, b in enumerate(blocks)}
         cluster_geoms = _show_partition(
@@ -572,7 +732,10 @@ def main(statefp: str, n_districts: int) -> int:
                   f"(threshold={threshold:,})",
         )
         print("Checking cluster graph connectivity...")
-        cluster_adj, n_cluster_bridges = _add_bridge_edges(cluster_nodes, cluster_adj)
+        cluster_adj, n_cluster_bridges, cluster_comp_of = _add_bridge_edges(
+            cluster_nodes, cluster_adj,
+            node_geoms={str(k): v for k, v in cluster_geoms.items()},
+        )
 
         # --- Pass 2 input graph visualisation ---
         _show_cluster_graph(cluster_nodes, cluster_adj,
@@ -693,10 +856,33 @@ def main(statefp: str, n_districts: int) -> int:
         print(f"  Run ID: {run_id}")
 
         # --- GeoJSON export ---
+        import json
         slug = state_name.lower().replace(" ", "_")
         geojson_path = os.path.join(OUTPUT_DIR, f"{slug}_2pass_run{run_id}.geojson")
         db.export_geojson(conn, run_id, geojson_path)
         print(f"  GeoJSON -> {geojson_path}")
+
+        # --- Connected-components GeoJSON (pre-bridge cluster graph) ---
+        import shapely as _shapely
+        comp_features = []
+        for i, node in enumerate(cluster_nodes):
+            cluster_id = int(node["geoid"])
+            geom = cluster_geoms.get(cluster_id)
+            if geom is None:
+                continue
+            comp_features.append({
+                "type": "Feature",
+                "geometry": json.loads(_shapely.to_geojson(geom)),
+                "properties": {
+                    "cluster_id": cluster_id,
+                    "component_id": cluster_comp_of[i],
+                    "pop": node["pop"],
+                },
+            })
+        comp_path = os.path.join(OUTPUT_DIR, f"{slug}_2pass_run{run_id}_components.geojson")
+        with open(comp_path, "w") as fh:
+            json.dump({"type": "FeatureCollection", "features": comp_features}, fh)
+        print(f"  Components GeoJSON -> {comp_path}")
 
         # --- Deviation log ---
         log_path = os.path.join(
