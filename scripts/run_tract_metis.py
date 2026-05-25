@@ -7,8 +7,8 @@ Usage:
 
 Algorithm:
   1. Fetch all census blocks; group by tract (first 11 chars of GEOID20).
-  2. avg_tract_pop = total_pop / n_populated_tracts;  threshold = 2 × avg_tract_pop.
-  3. Each tract starts as one subcluster.
+  2. Union block geometries per tract; explode MultiPolygons → singlepart subclusters.
+  3. threshold = 2 × median singlepart population.
   4. While any subcluster has pop > threshold:
        For each oversized subcluster, find its rook-connected components.
        METIS-bisect (k=2, haversine-inverse edge weights) each component that
@@ -589,7 +589,10 @@ def main(statefp: str, n_districts: int) -> None:
         rook_adjacency = db.fetch_adjacency(conn, "blocks", geoids)
         print(f"  {len(rook_adjacency):,} rook-adjacent block pairs.")
 
-        # --- Initial subclusters: one per tract (populated blocks only) ---
+        # --- Initial subclusters: one singlepart per tract (populated blocks only) ---
+        from shapely import wkb as swkb
+        from shapely.strtree import STRtree
+
         populated_blocks = [b for b in blocks if int(b["pop"]) > 0]
         zero_pop_blocks  = [b for b in blocks if int(b["pop"]) == 0]
         print(f"\nGrouping populated blocks by tract "
@@ -598,41 +601,75 @@ def main(statefp: str, n_districts: int) -> None:
         for b in populated_blocks:
             tract_to_blocks.setdefault(_tract_id(b["geoid"]), []).append(b["geoid"])
 
-        n_populated_tracts = sum(
-            1 for gs in tract_to_blocks.values()
-            if any(int(blocks_by_geoid[g]["pop"]) > 0 for g in gs)
-        )
-        avg_tract_pop = total_pop / max(n_populated_tracts, 1)
-        threshold = 2.0 * avg_tract_pop
-        print(f"  {len(tract_to_blocks):,} tracts  "
-              f"({n_populated_tracts:,} populated)")
-        print(f"  avg tract pop = {avg_tract_pop:,.0f}  "
-              f"threshold = {threshold:,.0f}")
-
         subclusters: dict[int, list[str]] = {}
         block_to_sub: dict[str, int] = {}
         next_id = 0
+        n_geo_splits = 0
+
         for tract_geoids in tract_to_blocks.values():
-            subclusters[next_id] = tract_geoids
-            for g in tract_geoids:
-                block_to_sub[g] = next_id
-            next_id += 1
+            geom_pairs = [
+                (g, swkb.loads(block_geoms_wkb[g]))
+                for g in tract_geoids if g in block_geoms_wkb
+            ]
+            if not geom_pairs:
+                continue
+            tract_union = unary_union([geom for _, geom in geom_pairs])
+            if tract_union.geom_type == "Polygon":
+                parts = [tract_union]
+            else:
+                parts = [g for g in tract_union.geoms
+                         if g.geom_type in ("Polygon", "MultiPolygon")]
+
+            if len(parts) <= 1:
+                subclusters[next_id] = tract_geoids
+                for g in tract_geoids:
+                    block_to_sub[g] = next_id
+                next_id += 1
+            else:
+                n_geo_splits += len(parts) - 1
+                tree = STRtree(parts)
+                part_blocks: dict[int, list[str]] = {i: [] for i in range(len(parts))}
+                for g, geom in geom_pairs:
+                    hits = tree.query(geom, predicate="intersects")
+                    part_idx = int(hits[0]) if len(hits) > 0 else 0
+                    part_blocks[part_idx].append(g)
+                for part_geoids in part_blocks.values():
+                    if part_geoids:
+                        subclusters[next_id] = part_geoids
+                        for g in part_geoids:
+                            block_to_sub[g] = next_id
+                        next_id += 1
+
+        if n_geo_splits:
+            print(f"  {n_geo_splits} tract(s) split into singleparts by geometry explosion.")
+
+        # Threshold: 2x median singlepart population
+        all_pops = sorted(_subcluster_pop(gs, blocks_by_geoid) for gs in subclusters.values())
+        median_pop = all_pops[len(all_pops) // 2]
+        threshold = 2.0 * median_pop
+        print(f"  {len(tract_to_blocks):,} tracts → {len(subclusters):,} initial subclusters  "
+              f"median pop = {median_pop:,.0f}  threshold = {threshold:,.0f}")
 
         # --- Iterative bisection ---
+        from tqdm import tqdm
+
         print("\nIterative bisection until no subcluster exceeds threshold...")
+        give_up: set[int] = set()
         iteration = 0
         while True:
             oversized = [
                 sid for sid, gs in subclusters.items()
-                if _subcluster_pop(gs, blocks_by_geoid) > threshold
+                if sid not in give_up
+                and _subcluster_pop(gs, blocks_by_geoid) > threshold
             ]
             if not oversized:
                 break
             iteration += 1
             n_split = 0
-            for sid in oversized:
+            for sid in tqdm(oversized, desc=f"  Iter {iteration}", unit="sub"):
                 geoids_s = subclusters.pop(sid)
                 comps = _rook_components(geoids_s, rook_adjacency)
+                produced: list[int] = []
                 for comp in comps:
                     comp_pop = _subcluster_pop(comp, blocks_by_geoid)
                     if comp_pop > threshold and len(comp) > 1:
@@ -644,10 +681,14 @@ def main(statefp: str, n_districts: int) -> None:
                         subclusters[next_id] = part
                         for g in part:
                             block_to_sub[g] = next_id
+                        produced.append(next_id)
                         next_id += 1
-
+                if all(_subcluster_pop(subclusters[nid], blocks_by_geoid) > threshold
+                       for nid in produced):
+                    give_up.update(produced)
+            suffix = f" ({len(give_up)} given up)" if give_up else ""
             print(f"  Iter {iteration}: {len(oversized)} oversized → "
-                  f"{n_split} additional splits → {len(subclusters):,} subclusters total")
+                  f"{n_split} additional splits → {len(subclusters):,} subclusters total{suffix}")
 
         print(f"  Done: {len(subclusters):,} subclusters after {iteration} iteration(s).")
 
@@ -842,8 +883,8 @@ def main(statefp: str, n_districts: int) -> None:
             "status":          "complete",
             "method":          "tract_metis",
             "n_tracts":        len(tract_to_blocks),
-            "n_populated_tracts": n_populated_tracts,
-            "avg_tract_pop":   int(avg_tract_pop),
+            "n_geo_splits":    n_geo_splits,
+            "median_sub_pop":  int(median_pop),
             "threshold":       int(threshold),
             "n_subclusters":   len(subclusters),
             "bisect_iters":    iteration,
