@@ -39,10 +39,29 @@ POSTGRES_USER=block-county
 POSTGRES_PASSWORD=your_db_password
 ```
 
-## Running
+## Loading geography tables
+
+`run_tract_metis.py` reads from `blocks_2020`, which must already be loaded into the database. Block groups, tracts, and counties are derived tables built by aggregating blocks upward through the hierarchy. Run the scripts in this order after blocks are loaded:
 
 ```bash
-uv run redistrict
+# 1. Aggregate blocks → block groups
+uv run --env-file .env python scripts/create_block_groups.py
+
+# 2. Aggregate block groups → tracts
+uv run --env-file .env python scripts/create_tracts.py
+
+# 3. Aggregate tracts → counties
+uv run --env-file .env python scripts/create_counties.py
+```
+
+Each script processes all states incrementally (skipping states already marked done in its state log table) and can be safely re-run. No TIGER imports are needed beyond blocks.
+
+## Running
+
+The below command will create 2 districts from the Census blocks of Rhode Island, which is identified by the FIPS code 44. Choose other states' FIPS and other district number values to customize your run.
+
+```bash
+uv run --env-file .env python scripts/run_tract_metis.py 44 2
 ```
 
 ## Tests
@@ -56,9 +75,8 @@ uv run pytest
 | Package | Purpose |
 |---|---|
 | pymetis | Graph partitioning (METIS wrapper, builds from source — requires cmake) |
-| scipy | Delaunay triangulation |
-| networkx | Graph construction and contiguity checking |
-| shapely / pyproj | Geometry and projection |
-| textual | TUI framework (extensible to full GUI) |
-| inquirerpy | Interactive CLI prompts (maintained replacement for abandoned PyInquirer) |
+| scipy | Spherical convex hull construction for adjacency and bridging |
+| numpy | Coordinate projection and array operations |
+| shapely | Geometry union, WKB loading, spatial indexing |
 | psycopg2-binary | PostgreSQL connection |
+| tqdm | Progress bars for bisection and bridging loops |
