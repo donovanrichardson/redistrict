@@ -294,14 +294,35 @@ def _build_subcluster_adj(
 def _add_bridge_edges(
     blocks: list[dict],
     adjacency: set[tuple[str, str]],
+    node_geoms: dict[str, object] | None = None,
     state_boundary=None,
 ) -> tuple[set[tuple[str, str]], int, list[int]]:
     """
-    Detect disconnected components and add bridge edges.
-    External nodes per component are determined by the 2D lat/lon convex hull
-    of centroid coordinates within the component.
+    Detect disconnected subcluster components and add bridge edges to connect them.
 
-    Returns (augmented_adjacency, n_bridges_added, comp_of).
+    Algorithm:
+    1. BFS over the rook adjacency graph to label each node with a component index.
+       Returns immediately if already fully connected.
+    2. For each component, determine exterior nodes. When node_geoms is provided,
+       the component's block geometries are unioned and exterior nodes are those
+       whose geometry intersects the union's exterior ring(s). Falls back to the
+       2D lat/lon convex hull of centroid coordinates when geometries are absent
+       or the exterior ring yields no intersecting nodes.
+    3. Project all exterior nodes onto the unit sphere and compute a single 3D
+       convex hull. The hull is pruned to an Urquhart graph by removing the
+       longest edge (by haversine) from each triangle. Every remaining edge that
+       spans two different components is a bridge candidate.
+    4. Discard candidates whose straight-line path exits the state boundary polygon
+       (union of counties, if provided via state_boundary).
+    5. Group remaining candidates by component pair. For each pair, sort by distance
+       and add the shortest max(1, n//3) edges (rounded down, minimum 1).
+    6. Fallback: build a Union-Find over all components using the added bridges.
+       If components remain disconnected, run a greedy Kruskal pass: sort all
+       O(n^2) exterior-point pairs (still-disconnected only) by haversine distance
+       and add the shortest edge that merges two different sets, until fully
+       connected. The fallback ignores the state boundary filter.
+
+    Returns (augmented_adjacency, n_bridges_added, component_index_of).
     """
     from scipy.spatial import ConvexHull
 
@@ -346,12 +367,40 @@ def _add_bridge_edges(
                       for j in range(min(component_count, 5)))
           + ("..." if component_count > 5 else ""))
 
+    def _iter_exteriors(geom):
+        if geom.geom_type == "Polygon":
+            yield geom.exterior
+        elif geom.geom_type in ("MultiPolygon", "GeometryCollection"):
+            for part in geom.geoms:
+                yield from _iter_exteriors(part)
+
     exterior_points: list[tuple[float, float]] = []
     exterior_component_indices: list[int] = []
     exterior_block_indices: list[int] = []
 
     for component_index, component in enumerate(components):
-        if len(component) < 3:
+        hull_indices: list[int]
+        component_polygons = (
+            [node_geoms[blocks[block_index]["geoid"]]
+             for block_index in component
+             if blocks[block_index]["geoid"] in node_geoms]
+            if node_geoms else []
+        )
+        if component_polygons:
+            component_union = unary_union(component_polygons)
+            exterior_rings = list(_iter_exteriors(component_union))
+            if exterior_rings:
+                exterior_ring_union = unary_union(exterior_rings)
+                hull_indices = [
+                    block_index for block_index in component
+                    if node_geoms.get(blocks[block_index]["geoid"]) is not None
+                    and node_geoms[blocks[block_index]["geoid"]].intersects(exterior_ring_union)
+                ]
+                if not hull_indices:
+                    hull_indices = component
+            else:
+                hull_indices = component
+        elif len(component) < 3:
             hull_indices = component
         else:
             component_pts = np.column_stack([
@@ -379,10 +428,31 @@ def _add_bridge_edges(
     ])
     try:
         combined = ConvexHull(sphere_points)
+
+        # Urquhart pruning: for each simplex, mark its longest edge for removal.
+        # An edge is excluded if it is the longest in any triangle it belongs to.
+        longest_edges: set[tuple[int, int]] = set()
+        for simplex in combined.simplices:
+            edge_distances = []
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    ai, aj = int(simplex[i]), int(simplex[j])
+                    lat_a, lon_a = exterior_points[ai]
+                    lat_b, lon_b = exterior_points[aj]
+                    edge_distances.append((
+                        _haversine_km(lat_a, lon_a, lat_b, lon_b),
+                        min(ai, aj), max(ai, aj),
+                    ))
+            edge_distances.sort(reverse=True)
+            _, ea, eb = edge_distances[0]
+            longest_edges.add((ea, eb))
+
         for simplex in combined.simplices:
             for i in range(3):
                 for j in range(i + 1, 3):
                     ai, aj = int(simplex[i]), int(simplex[j])
+                    if (min(ai, aj), max(ai, aj)) in longest_edges:
+                        continue
                     ca, cj = exterior_component_indices[ai], exterior_component_indices[aj]
                     if ca != cj:
                         ba, bj = exterior_block_indices[ai], exterior_block_indices[aj]
@@ -756,7 +826,10 @@ def main(statefp: str, n_districts: int) -> None:
         print("\nChecking subcluster graph connectivity...")
         subcluster_rook_adjacency = set(sub_adj)
         sub_adj, bridge_count, subcluster_component_of = _add_bridge_edges(
-            subcluster_nodes, sub_adj, state_boundary,
+            subcluster_nodes, sub_adj,
+            node_geoms={str(subcluster_id): geometry
+                        for subcluster_id, geometry in subcluster_geoms.items()},
+            state_boundary=state_boundary,
         )
         subcluster_bridge_adjacency = sub_adj - subcluster_rook_adjacency
 
