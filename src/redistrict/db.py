@@ -293,6 +293,26 @@ def fetch_adjacency(
         return {(r[0], r[1]) for r in cur.fetchall()}
 
 
+def fetch_state_boundary(
+    conn: psycopg2.extensions.connection,
+    statefp: str,
+) -> bytes | None:
+    """Return WKB bytes for the union of all county geometries for the state."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ST_AsEWKB(ST_Union(geom))
+            FROM public.counties_2020
+            WHERE statefp20 = %s
+            """,
+            (statefp,),
+        )
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return bytes(row[0])
+
+
 def fetch_block_geoms(
     conn: psycopg2.extensions.connection,
     statefp: str,

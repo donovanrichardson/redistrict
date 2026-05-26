@@ -294,6 +294,7 @@ def _build_subcluster_adj(
 def _add_bridge_edges(
     blocks: list[dict],
     adjacency: set[tuple[str, str]],
+    state_boundary=None,
 ) -> tuple[set[tuple[str, str]], int, list[int]]:
     """
     Detect disconnected components and add bridge edges.
@@ -392,6 +393,22 @@ def _add_bridge_edges(
                         bridge_candidates.append((distance, ba, bj, ca, cj))
     except Exception:
         pass
+
+    # Discard bridge candidates whose line segment exits the state boundary
+    if state_boundary is not None and bridge_candidates:
+        from shapely.geometry import LineString
+        n_before = len(bridge_candidates)
+        bridge_candidates = [
+            (distance, ba, bj, ca, cj)
+            for distance, ba, bj, ca, cj in bridge_candidates
+            if state_boundary.covers(LineString([
+                (float(blocks[ba]["lon"]), float(blocks[ba]["lat"])),
+                (float(blocks[bj]["lon"]), float(blocks[bj]["lat"])),
+            ]))
+        ]
+        n_discarded = n_before - len(bridge_candidates)
+        if n_discarded:
+            print(f"  Discarded {n_discarded} bridge candidate(s) crossing state boundary.")
 
     # Group candidates by component pair; for each pair add the shortest 1/3 (min 1)
     from tqdm import tqdm
@@ -593,6 +610,17 @@ def main(statefp: str, n_districts: int) -> None:
         populated_blocks_by_geoid = {b["geoid"]: b for b in populated_blocks}
         print(f"  {len(blocks):,} blocks, total pop {total_pop:,}")
 
+        # --- State boundary ---
+        print("\nFetching state boundary...")
+        _state_boundary_wkb = db.fetch_state_boundary(conn, statefp)
+        if _state_boundary_wkb:
+            from shapely import wkb as swkb
+            state_boundary = swkb.loads(_state_boundary_wkb)
+            print("  State boundary loaded.")
+        else:
+            state_boundary = None
+            print("  No county geometries found — state boundary filter disabled.")
+
         # --- Block geometries ---
         print("\nFetching block geometries...")
         block_geoms_wkb = db.fetch_block_geoms(conn, statefp)
@@ -728,7 +756,7 @@ def main(statefp: str, n_districts: int) -> None:
         print("\nChecking subcluster graph connectivity...")
         subcluster_rook_adjacency = set(sub_adj)
         sub_adj, bridge_count, subcluster_component_of = _add_bridge_edges(
-            subcluster_nodes, sub_adj,
+            subcluster_nodes, sub_adj, state_boundary,
         )
         subcluster_bridge_adjacency = sub_adj - subcluster_rook_adjacency
 
